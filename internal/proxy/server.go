@@ -3,25 +3,29 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"quickwork-openai/internal/accounts"
+	"quickwork-openai/internal/config"
 )
 
 type Server struct {
-	cfg      *Config
-	sessions *SessionSource
-	tokens   *TokenStore
+	cfg      *config.Config
+	accounts *accounts.Manager
+	tokens   *APIKeyAuth
 	upstream *Upstream
 }
 
-func NewServer(cfg *Config) *Server {
+func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 	return &Server{
 		cfg:      cfg,
-		sessions: NewSessionSource(cfg),
-		tokens:   NewTokenStore(cfg.TokensFile),
+		accounts: mgr,
+		tokens:   NewAPIKeyAuth(cfg.APIKeys),
 		upstream: NewUpstream(cfg),
 	}
 }
@@ -124,16 +128,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		bridgeAllowed = map[string]bool{choiceName: true}
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeout)
+	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout.Duration())
 	defer cancel()
-
-	sess, err := s.sessions.Get(ctx)
-	if err != nil {
-		s.sessions.invalidate()
-		writeOpenAIError(w, http.StatusUnauthorized, "upstream_session_unavailable",
-			"no usable QuickWork session: "+err.Error()+"; run the Python login helper")
-		return
-	}
 
 	threadID := strings.TrimSpace(r.Header.Get("X-Thread-Id"))
 	id := "chatcmpl-" + strings.ReplaceAll(uuid(), "-", "")
@@ -147,9 +143,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if !req.Stream {
-		res, err := s.upstream.Chat(ctx, sess, in, nil)
-		if err != nil {
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
+		var res ChatResult
+		var lastErr error
+		for range s.maxAttempts(ctx) {
+			acct, err := s.accounts.Next(ctx)
+			if err != nil {
+				lastErr = err
+				break
+			}
+			sess := SessionFromAccount(acct, s.cfg)
+			if err := sess.validate(); err != nil {
+				s.accounts.ReportFailure(ctx, acct.ID, err)
+				lastErr = err
+				continue
+			}
+			res, err = s.upstream.Chat(ctx, sess, in, nil)
+			if err == nil {
+				lastErr = nil
+				break
+			}
+			lastErr = err
+			s.accounts.ReportFailure(ctx, acct.ID, err)
+			if ctx.Err() != nil {
+				break
+			}
+		}
+		if lastErr != nil {
+			status, code := http.StatusBadGateway, "upstream_error"
+			if errors.Is(lastErr, accounts.ErrNoAccounts) {
+				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
+			}
+			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
 		text := res.Text
@@ -201,19 +225,40 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusInternalServerError, "streaming_unavailable", "response writer does not support flushing")
 		return
 	}
-	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	if threadID != "" {
-		w.Header().Set("X-Thread-Id", threadID)
-	}
-	w.WriteHeader(http.StatusOK)
-
-	writePayload := func(payload map[string]any) {
+	started := false
+	writeRaw := func(payload map[string]any) {
 		body, _ := json.Marshal(payload)
 		_, _ = fmt.Fprintf(w, "data: %s\n\n", body)
 		flusher.Flush()
+	}
+	ensureStarted := func() {
+		if started {
+			return
+		}
+		started = true
+		w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("X-Accel-Buffering", "no")
+		if threadID != "" {
+			w.Header().Set("X-Thread-Id", threadID)
+		}
+		w.WriteHeader(http.StatusOK)
+		writeRaw(map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []map[string]any{{
+				"index":         0,
+				"delta":         map[string]any{"role": "assistant"},
+				"finish_reason": nil,
+			}},
+		})
+	}
+	writePayload := func(payload map[string]any) {
+		ensureStarted()
+		writeRaw(payload)
 	}
 	writeChunk := func(delta map[string]any, finish any) {
 		writePayload(map[string]any{
@@ -235,8 +280,6 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"code":    "upstream_error",
 		}})
 	}
-
-	writeChunk(map[string]any{"role": "assistant"}, nil)
 
 	sawText := false
 	sawTool := false
@@ -296,37 +339,70 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		sawTool = true
 	}
 
-	res, err := s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
-		switch ev.Type {
-		case "text":
-			if ev.Text == "" {
-				return nil
-			}
-			if bridgeActive {
-				bridgeBuffer.WriteString(ev.Text)
-				return nil
-			}
-			sawText = true
-			writeChunk(map[string]any{"content": ev.Text}, nil)
-		case "tool_call":
-			if bridgeActive {
-				return nil
-			}
-			if ev.ToolCall != nil {
-				emitTool(*ev.ToolCall)
-			}
-		case "tool_call_update":
-			if bridgeActive {
-				return nil
-			}
-			if ev.ToolCall != nil {
-				emitTool(*ev.ToolCall)
-			}
+	var res ChatResult
+	var lastErr error
+	for range s.maxAttempts(ctx) {
+		acct, err := s.accounts.Next(ctx)
+		if err != nil {
+			lastErr = err
+			break
 		}
-		return nil
-	})
-	if err != nil {
-		writeStreamError(err.Error())
+		sess := SessionFromAccount(acct, s.cfg)
+		if err := sess.validate(); err != nil {
+			s.accounts.ReportFailure(ctx, acct.ID, err)
+			lastErr = err
+			continue
+		}
+		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
+			switch ev.Type {
+			case "text":
+				if ev.Text == "" {
+					return nil
+				}
+				if bridgeActive {
+					bridgeBuffer.WriteString(ev.Text)
+					return nil
+				}
+				sawText = true
+				writeChunk(map[string]any{"content": ev.Text}, nil)
+			case "tool_call", "tool_call_update":
+				if bridgeActive {
+					return nil
+				}
+				if ev.ToolCall != nil {
+					emitTool(*ev.ToolCall)
+				}
+			}
+			return nil
+		})
+		if err == nil {
+			lastErr = nil
+			break
+		}
+		lastErr = err
+		s.accounts.ReportFailure(ctx, acct.ID, err)
+		if started || ctx.Err() != nil {
+			break
+		}
+		// Nothing reached the client yet; reset per-attempt state and try
+		// the next account in rotation.
+		sawText = false
+		sawTool = false
+		bridgeBuffer.Reset()
+		toolIndex = 0
+		toolIndexes = make(map[string]int)
+		sentArgs = make(map[string]string)
+	}
+	if lastErr != nil {
+		if !started {
+			status, code := http.StatusBadGateway, "upstream_error"
+			if errors.Is(lastErr, accounts.ErrNoAccounts) {
+				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
+			}
+			writeOpenAIError(w, status, code, lastErr.Error())
+			return
+		}
+		writeStreamError(lastErr.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
@@ -399,6 +475,21 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+func (s *Server) maxAttempts(ctx context.Context) int {
+	n, err := s.accounts.EnabledCount(ctx)
+	if err != nil || n < 1 {
+		return 1
+	}
+	max := s.cfg.MaxAttempts
+	if max < 1 {
+		max = 1
+	}
+	if n < max {
+		return n
+	}
+	return max
 }
 
 func (s *Server) mapModel(model string) string {

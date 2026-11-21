@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+
+	"quickwork-openai/internal/config"
 )
 
 const (
@@ -20,10 +22,10 @@ const (
 )
 
 type Upstream struct {
-	cfg *Config
+	cfg *config.Config
 }
 
-func NewUpstream(cfg *Config) *Upstream {
+func NewUpstream(cfg *config.Config) *Upstream {
 	return &Upstream{cfg: cfg}
 }
 

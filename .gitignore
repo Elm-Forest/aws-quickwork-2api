@@ -1,15 +1,13 @@
 # Runtime secrets and session state
 data/
+*.db
+*.db-shm
+*.db-wal
 
 # Build output
 bin/
 dist/
 *.exe
-
-# Python
-__pycache__/
-*.py[cod]
-.venv/
 
 # Local artifacts
 page-signup.png

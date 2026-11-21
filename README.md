@@ -2,7 +2,7 @@
 
 把 Amazon Quick（QuickWork）桌面端的聊天能力转换成 **OpenAI 兼容的 HTTP API**。
 
-项目内置原生 OAuth 登录：不用启动官方桌面应用，也不用运行 outpost 进程。登录后由 Go 反代把 `/v1/chat/completions` 请求转换为 QuickWork WebSocket 帧，并把结果转回普通 JSON 或 SSE。
+项目是单一 Go 可执行文件：原生 OAuth 登录、账号存储、token 刷新和反代全部由 Go 完成，不需要 Python，也不用启动官方桌面应用或 outpost 进程。登录后由反代把 `/v1/chat/completions` 请求转换为 QuickWork WebSocket 帧，并把结果转回普通 JSON 或 SSE。
 
 > 非官方项目，与 Amazon / AWS 无关联。请仅在你拥有或获得明确授权的账号上使用，并遵守相关服务条款。
 
@@ -11,7 +11,9 @@
 - `POST /v1/chat/completions`，支持流式（SSE）与非流式响应
 - `GET /v1/models`，返回本地模型别名
 - 原生 social 登录（AWS IAM Identity Center OIDC）与企业 OIDC 登录，使用 PKCE
-- `refresh` 命令刷新 token，无需重新打开浏览器
+- 服务端配置集中存放在 `config.json`
+- 账号存放在 SQLite（`data/quickwork.db`），支持多账号轮询与自动刷新
+- 请求按轮询选择账号；到期 token 自动 refresh；失败时切换到下一个账号重试
 - 可选本地 API key 保护
 - 默认每轮对话结束后删除上游会话，避免污染聊天列表
 - 保留 `assistant.tool_calls` / `role: tool` 历史，客户端工具调用链不会丢上下文
@@ -22,14 +24,13 @@
 
 ## 环境要求
 
-- 用于构建反代：Go 1.26+
-- 用于登录：Python 3.10+（仅使用标准库，无需安装依赖）
+- Go 1.26+（仅构建时需要）
 - 一个可正常登录的 Amazon Quick 账号
-- 浏览器与登录脚本运行在**同一台机器**，且本机 `18080` 端口可被浏览器访问
+- 浏览器与 `quickproxy login` 运行在**同一台机器**，且本机回调端口（默认 `18080`）可被浏览器访问
 
 ## 快速开始
 
-### 1. 构建反代
+### 1. 构建
 
 ```bash
 cd quickwork-openai
@@ -40,39 +41,32 @@ go build -o bin/quickproxy.exe ./cmd/quickproxy   # Windows
 ### 2. 登录上游账号
 
 ```bash
-python auth/quickauth.py upstream-login --provider social
+./bin/quickproxy login --provider social
 ```
 
-终端会打印一个 discovery URL，例如：
+首次运行会在当前目录创建 `config.json`，并在 `data/quickwork.db` 初始化 SQLite。终端会打印一个 discovery URL，例如：
 
 ```
 https://quick.aws.com/sn?qwSurface=desktop:<nonce>:18080:1.2.4660
 ```
 
-在**同一台机器**的浏览器中打开它，完成登录。工具会：
-
-1. 接收浏览器回调；
-2. 完成 OAuth / PKCE 与 token 交换；
-3. 获取用户信息；
-4. 写入 `data/session.json`（反代使用）和 `data/upstream.json`（refresh 使用）。
-
-终端只打印账号显示信息、`ws_host` 和到期时间，不打印 token。
+在**同一台机器**的浏览器中打开它，完成登录。工具会接收浏览器回调、完成 OAuth / PKCE、交换 token、获取用户信息，并把账号写入 SQLite。完成后终端只打印账号显示信息、`ws_host` 和到期时间，不打印 token。
 
 企业 SSO 登录：
 
 ```bash
-python auth/quickauth.py upstream-login --provider enterprise --region us-east-1
+./bin/quickproxy login --provider enterprise --region us-east-1
 ```
+
+需要登录多个账号时，重复执行 `login` 即可。相同 email + tenant 的账号会更新，不会重复插入。
 
 ### 3. 启动反代
 
 ```bash
-./bin/quickproxy.exe -addr 127.0.0.1:8080 \
-  -tokens data/tokens.json \
-  -session data/session.json
+./bin/quickproxy serve
 ```
 
-如果 `data/tokens.json` 不存在或为空，反代会关闭 API key 鉴权，适合纯本机使用。
+服务读取当前目录的 `config.json`。默认监听 `127.0.0.1:8080`。如果 `api_keys` 为空，代理关闭 API key 鉴权，适合纯本机使用。
 
 ### 4. 调用
 
@@ -97,7 +91,7 @@ Python SDK：
 ```python
 from openai import OpenAI
 
-# 未配置 data/tokens.json 时 api_key 可填任意值；配置后填对应 key。
+# api_keys 为空时 api_key 可填任意值；配置后填对应 key。
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
 
 for chunk in client.chat.completions.create(
@@ -108,103 +102,138 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-## 发布
+## 配置 `config.json`
 
-推送 `v*` tag 会触发 `.github/workflows/release.yml`，构建并发布：
-
-| 平台 | 架构 | 产物 |
-|---|---|---|
-| Windows | amd64 | `quickproxy-windows-amd64.exe` |
-| Windows | arm64 | `quickproxy-windows-arm64.exe` |
-| Linux | amd64 | `quickproxy-linux-amd64` |
-| Linux | arm64 | `quickproxy-linux-arm64` |
-
-同时生成 `SHA256SUMS`。手动运行该 workflow 只上传 Actions artifacts，不创建 release。
-
-```bash
-git tag -a v0.2.0 -m "v0.2.0"
-git push origin v0.2.0
-```
-
-## 命令
-
-### 登录与凭据
-
-| 命令 | 说明 |
-|---|---|
-| `python auth/quickauth.py upstream-login` | 打开浏览器登录并写出 session |
-| `python auth/quickauth.py refresh` | 刷新 token 并重写 `data/session.json` |
-| `python auth/quickauth.py status` | 显示 session 的 provider、ws_host、账号与到期时间 |
-| `python auth/quickauth.py logout` | 删除 `data/session.json` 与 `data/upstream.json` |
-
-`upstream-login` 常用参数：
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `--provider` | `social` | `social`、`enterprise`、`gateway`、`social_gateway` |
-| `--build-stage` | `prod` | `prod`、`beta`、`integ`、`dev` |
-| `--region` | 空 | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
-| `--port` | `18080` | 本机 OAuth 回调端口 |
-| `--timeout` | `3600` | 等待浏览器完成登录的秒数 |
-| `--open` | 关闭 | 同时用默认浏览器打开 URL |
-
-### 反代参数
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `-addr` | `127.0.0.1:8080` | 监听地址 |
-| `-session` | `data/session.json` | 登录工具写出的 session |
-| `-tokens` | `data/tokens.json` | 本地 API key 文件；不存在/为空时关闭鉴权 |
-| `-models` | `smart,fast,balanced,auto` | `/v1/models` 返回值与 model 白名单 |
-| `-default-model` | `smart` | 未知 model 的映射 |
-| `-timeout` | `5m` | 单次上游请求超时 |
-| `-keep-sessions` | `false` | 保留上游会话，不在一轮结束后删除 |
-| `-thinking` | 空 | `off`、`low`、`medium`、`high` |
-| `-app-version` | `1.2.4660` | 上游握手使用的 appVersion |
-| `-surface` | `QUICK_WORK_DESKTOP_WINDOWS` | 上游握手使用的 surfaceType |
-| `-timezone` | `UTC` | 请求中的 user_timezone |
-| `-locale` | `en-US` | 请求中的 user_locale |
-
-需要 API key 时，创建 `data/tokens.json`：
+`quickproxy serve` / `login` 在文件不存在时会写入默认配置。完整示例：
 
 ```json
 {
-  "tokens": {
-    "sk-local": {
-      "email": "you@example.com",
-      "created_at": 0
-    }
+  "addr": "127.0.0.1:8080",
+  "database": "data/quickwork.db",
+  "api_keys": [],
+  "models": ["smart", "fast", "balanced", "auto"],
+  "default_model": "smart",
+  "request_timeout": "5m",
+  "refresh_before": "10m",
+  "max_attempts": 3,
+  "app_version": "1.2.4660",
+  "surface": "QUICK_WORK_DESKTOP_WINDOWS",
+  "outpost_id": "",
+  "working_session_id": "",
+  "timezone": "UTC",
+  "locale": "en-US",
+  "thinking_effort": "",
+  "keep_sessions": false,
+  "oauth": {
+    "provider": "social",
+    "build_stage": "prod",
+    "region": "",
+    "callback_port": 18080,
+    "timeout": "1h"
   }
 }
 ```
 
+| 字段 | 默认 | 说明 |
+|---|---|---|
+| `addr` | `127.0.0.1:8080` | HTTP 监听地址 |
+| `database` | `data/quickwork.db` | SQLite 文件；相对路径基于 `config.json` 所在目录 |
+| `api_keys` | `[]` | 允许的本地 API key；为空时关闭鉴权 |
+| `models` | `smart,fast,balanced,auto` | `/v1/models` 返回值与 model 白名单 |
+| `default_model` | `smart` | 未知 model 的映射 |
+| `request_timeout` | `5m` | 单次上游请求超时 |
+| `refresh_before` | `10m` | token 距离到期小于该值时自动 refresh |
+| `max_attempts` | `3` | 单次请求最多尝试的账号数 |
+| `app_version` | `1.2.4660` | 上游握手使用的 appVersion |
+| `surface` | `QUICK_WORK_DESKTOP_WINDOWS` | 上游握手使用的 surfaceType |
+| `outpost_id` / `working_session_id` | 空 | 上游握手可选字段 |
+| `timezone` / `locale` | `UTC` / `en-US` | `user_message` 中的时区与语言 |
+| `thinking_effort` | 空 | `off`、`low`、`medium`、`high` |
+| `keep_sessions` | `false` | 保留上游会话，不在一轮结束后删除 |
+| `oauth.provider` | `social` | `login` 默认 provider |
+| `oauth.build_stage` | `prod` | `prod`、`beta`、`integ`、`dev` |
+| `oauth.region` | 空 | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
+| `oauth.callback_port` | `18080` | 本机 OAuth 回调端口 |
+| `oauth.timeout` | `1h` | 等待浏览器完成登录的超时 |
+
+时间字段接受 Go duration 字符串（`30s`、`5m`、`1h`）。
+
+需要 API key 时，把 key 写进 `api_keys`：
+
+```json
+{
+  "api_keys": ["sk-local"]
+}
+```
+
 之后请求需带 `Authorization: Bearer sk-local`（或 `X-Api-Key: sk-local`）。
+
+## 命令
+
+| 命令 | 说明 |
+|---|---|
+| `quickproxy serve` | 启动反代 |
+| `quickproxy login` | 浏览器 OAuth 登录并写入 SQLite |
+| `quickproxy accounts` | 列出账号、到期时间、使用次数与最近错误 |
+| `quickproxy refresh` | 刷新全部账号的 token |
+| `quickproxy refresh -account ID` | 只刷新一个账号 |
+| `quickproxy logout -all` | 删除全部账号 |
+| `quickproxy logout -account ID` | 删除一个账号 |
+
+所有命令都支持 `-config PATH`，默认 `config.json`。
+
+从旧版升级：旧的 `auth/quickauth.py` 已移除，`data/session.json` / `data/upstream.json` 不再读取。请重新执行一次 `quickproxy login`；之后所有账号都由 SQLite 管理。
+
+`login` 常用参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-provider` | `config.oauth.provider` | `social`、`enterprise`、`gateway`、`social_gateway` |
+| `-stage` | `config.oauth.build_stage` | `prod`、`beta`、`integ`、`dev` |
+| `-region` | `config.oauth.region` | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
+| `-port` | `config.oauth.callback_port` | 本机回调端口 |
+| `-timeout` | `config.oauth.timeout` | 等待浏览器完成登录的超时 |
+| `-open` | 关闭 | 同时用默认浏览器打开 URL |
+
+## 多账号轮询
+
+账号存在 SQLite 的 `accounts` 表，按 ID 轮询：
+
+1. 每个请求选择下一个启用账号。
+2. 如果 token 在 `refresh_before` 内到期，先用 refresh token 自动刷新。
+3. 刷新失败或账号不可用时记录 `last_error`，跳过该账号继续轮询。
+4. 单次请求最多尝试 `max_attempts` 个账号；非流式请求和尚未向客户端发送任何数据的流式请求会自动换号重试。
+5. 一旦流式响应已经开始，就不会中途换号，避免客户端收到重复内容。
+
+`quickproxy accounts` 可查看每个账号的状态；`quickproxy refresh` 会刷新全部账号。上游 refresh token 失效时，对应账号需要重新执行 `quickproxy login`。
 
 ## 工作方式
 
 ```mermaid
 sequenceDiagram
     participant U as 用户
-    participant CLI as quickauth.py
+    participant CLI as quickproxy login
     participant B as 浏览器
     participant Q as Amazon Quick
-    participant P as quickproxy
+    participant DB as SQLite
+    participant P as quickproxy serve
 
-    U->>CLI: upstream-login
+    U->>CLI: login
     CLI-->>U: 打印 discovery URL
     U->>B: 打开 URL 并登录
     B->>CLI: 回调 code
     CLI->>Q: 换取 token / 获取用户信息
-    CLI->>CLI: 写入 data/session.json
+    CLI->>DB: 写入账号
     U->>P: OpenAI /v1/chat/completions
+    P->>DB: 轮询选择账号
     P->>Q: WebSocket 帧
     Q-->>P: text_delta / message_complete
     P-->>U: JSON 或 SSE
 ```
 
-- 登录完全在 `auth/quickauth.py` 内完成，不依赖官方桌面应用或 outpost。
-- `quickproxy` 使用 `session.json` 中的 `jwt`、`ws_host` 和 `provider` 连接上游 WebSocket。
-- 上游不是 OpenAI HTTP API，而是 WebSocket JSON 帧；本项目的 `internal/proxy/wire.go` 负责帧编码与 event-stream 解码。
+- 登录完全在 `quickproxy login` 内完成，不依赖官方桌面应用或 outpost。
+- `quickproxy serve` 从 SQLite 读取 `jwt`、`ws_host` 和 `provider`，连接上游 WebSocket。
+- 上游不是 OpenAI HTTP API，而是 WebSocket JSON 帧；`internal/proxy/wire.go` 负责帧编码与 event-stream 解码。
 
 ### 提示词与工具调用
 
@@ -221,10 +250,11 @@ sequenceDiagram
 
 ## 安全与隐私
 
-- `data/` 包含 access token、refresh token、client secret 和用户信息，已被 `.gitignore` 排除，权限尽量设为 `0600`。
+- `data/quickwork.db` 包含 access token、refresh token、client secret 和用户信息，已被 `.gitignore` 排除。
+- `config.json` 默认不含密钥；如果写入 `api_keys`，不要提交真实 key。
 - 登录密码只在 Amazon 的浏览器页面中输入，本项目不会保存密码。
 - 反代默认只监听 `127.0.0.1`。不要把端口直接暴露到公网；如确需远程访问，请自行加 TLS 与访问控制。
-- `logout` 会删除本地 session 与 refresh 状态。
+- `quickproxy logout -all` 会删除本地账号与 refresh 状态。
 - 不要提交或分享 `data/` 目录。
 
 ## 限制
@@ -235,29 +265,35 @@ sequenceDiagram
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
 - social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。
-- 上游 token 通常约 1 小时到期，运行 `refresh` 可延长。
-- 上游接口可能随官方客户端更新而变化；若登录或聊天失败，先重新执行 `upstream-login`。
+- 上游 access token 通常约 1 小时到期，反代会按 `refresh_before` 自动刷新；也可手动执行 `quickproxy refresh`。
+- 多账号轮询按请求选择账号，不按 token 用量或配额调度。
+- 上游接口可能随官方客户端更新而变化；若登录或聊天失败，先重新执行 `quickproxy login`。
 - 本项目与 Amazon / AWS 无关联，不提供任何服务保证。
 
 ## 故障排查
 
 | 现象 | 处理 |
 |---|---|
-| `cannot listen on 127.0.0.1:18080` | 关闭占用 18080 的其他进程后重试 |
-| 浏览器登录后一直等待 | 确认浏览器与脚本在同一台机器，且回调端口可达；不要关闭终端 |
-| `upstream_session_unavailable` | 运行 `upstream-login`，或先运行 `refresh` |
-| `401 invalid_api_key` | 检查 `data/tokens.json` 与请求头中的 key 是否一致 |
-| 登录页面报错 | 查看终端输出的错误；确认 `--provider` 与账号类型匹配 |
-| token 过期 | 运行 `python auth/quickauth.py refresh` |
+| `cannot listen on 127.0.0.1:18080` | 关闭占用 18080 的其他进程，或用 `-port` / `oauth.callback_port` 换端口 |
+| 浏览器登录后一直等待 | 确认浏览器与命令在同一台机器，且回调端口可达；不要关闭终端 |
+| `upstream_session_unavailable` / `no accounts configured` | 运行 `quickproxy login` |
+| `401 invalid_api_key` | 检查 `config.json` 的 `api_keys` 与请求头中的 key 是否一致 |
+| 登录页面报错 | 查看终端输出的错误；确认 `-provider` 与账号类型匹配 |
+| 多账号请求总是失败 | 运行 `quickproxy accounts` 查看 `last_error`；对失效账号重新 `login` 或 `logout -account ID` |
+| token 过期 | 通常自动刷新；也可运行 `quickproxy refresh` |
 
 ## 目录
 
 ```
 quickwork-openai/
-  auth/quickauth.py        原生 OAuth 登录、refresh、status、logout
-  cmd/quickproxy/          Go 反代入口
-  internal/proxy/          session、WebSocket codec、OpenAI handler
-  data/                    运行期凭据与会话（gitignored）
+  config.json              服务端配置（首次运行自动生成）
+  cmd/quickproxy/          CLI：serve / login / accounts / refresh / logout
+  internal/config/         config.json 加载与默认值
+  internal/oauth/          原生 OAuth、PKCE、token refresh、user info
+  internal/store/          SQLite 账号存储
+  internal/accounts/       多账号轮询与自动刷新
+  internal/proxy/          WebSocket codec、OpenAI handler
+  data/quickwork.db        运行期账号库（gitignored）
 ```
 
 ## License

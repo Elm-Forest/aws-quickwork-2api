@@ -1,71 +1,27 @@
 package proxy
 
 import (
-	"encoding/json"
 	"net/http"
-	"os"
 	"strings"
-	"sync"
-	"time"
 )
 
-type tokenEntry struct {
-	Email     string `json:"email"`
-	CreatedAt int64  `json:"created_at"`
+// APIKeyAuth validates local proxy API keys from config.json. An empty key
+// list disables authentication for local-only deployments.
+type APIKeyAuth struct {
+	keys map[string]bool
 }
 
-type tokenFile struct {
-	Tokens map[string]tokenEntry `json:"tokens"`
+func NewAPIKeyAuth(keys []string) *APIKeyAuth {
+	set := make(map[string]bool, len(keys))
+	for _, key := range keys {
+		if key = strings.TrimSpace(key); key != "" {
+			set[key] = true
+		}
+	}
+	return &APIKeyAuth{keys: set}
 }
 
-// TokenStore validates proxy API keys minted by the Python auth helper.
-// When no token file exists (or it contains no tokens) authentication is
-// disabled, which keeps a purely local deployment frictionless.
-type TokenStore struct {
-	path string
-
-	mu     sync.Mutex
-	mod    time.Time
-	tokens map[string]tokenEntry
-	bad    bool
-}
-
-func NewTokenStore(path string) *TokenStore {
-	return &TokenStore{path: path}
-}
-
-func (t *TokenStore) reload() {
-	if t.path == "" {
-		return
-	}
-	st, err := os.Stat(t.path)
-	if err != nil {
-		t.tokens = nil
-		t.mod = time.Time{}
-		t.bad = false
-		return
-	}
-	if st.ModTime().Equal(t.mod) {
-		return
-	}
-	body, err := os.ReadFile(t.path)
-	if err != nil {
-		t.bad = true
-		return
-	}
-	var tf tokenFile
-	if err := json.Unmarshal(body, &tf); err != nil {
-		t.bad = true
-		t.tokens = nil
-		t.mod = st.ModTime()
-		return
-	}
-	t.tokens = tf.Tokens
-	t.bad = false
-	t.mod = st.ModTime()
-}
-
-func (t *TokenStore) tokenFromRequest(r *http.Request) string {
+func tokenFromRequest(r *http.Request) string {
 	if h := r.Header.Get("Authorization"); h != "" {
 		if len(h) > 7 && strings.EqualFold(h[:7], "Bearer ") {
 			return strings.TrimSpace(h[7:])
@@ -78,20 +34,13 @@ func (t *TokenStore) tokenFromRequest(r *http.Request) string {
 }
 
 // Allowed reports whether the request may use the proxy.
-func (t *TokenStore) Allowed(r *http.Request) bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	t.reload()
-	if t.bad {
-		return false
-	}
-	if len(t.tokens) == 0 {
+func (a *APIKeyAuth) Allowed(r *http.Request) bool {
+	if len(a.keys) == 0 {
 		return true
 	}
-	token := t.tokenFromRequest(r)
+	token := tokenFromRequest(r)
 	if token == "" {
 		return false
 	}
-	_, ok := t.tokens[token]
-	return ok
+	return a.keys[token]
 }

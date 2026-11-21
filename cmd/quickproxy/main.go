@@ -1,131 +1,371 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"strings"
 	"syscall"
+	"text/tabwriter"
 	"time"
 
+	"quickwork-openai/internal/accounts"
+	"quickwork-openai/internal/config"
+	"quickwork-openai/internal/oauth"
 	"quickwork-openai/internal/proxy"
+	"quickwork-openai/internal/store"
 )
 
-func env(key, fallback string) string {
-	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
-		return v
-	}
-	return fallback
-}
-
-type outpostInfo struct {
-	URL       string `json:"url"`
-	TokenFile string `json:"token_file"`
-	PID       int    `json:"pid"`
-}
-
 func main() {
-	addr := flag.String("addr", env("QW_PROXY_ADDR", "127.0.0.1:8080"), "listen address")
-	sessionFile := flag.String("session", env("QW_SESSION_FILE", "data/session.json"), "outpost session JSON (written by the Python login helper)")
-	outpostURL := flag.String("outpost", env("QW_OUTPOST_URL", ""), "local outpost base URL, e.g. http://127.0.0.1:8780")
-	tokenFile := flag.String("instance-token-file", env("QW_INSTANCE_TOKEN_FILE", "data/instance_token"), "outpost instance token file")
-	tokensFile := flag.String("tokens", env("QW_TOKENS_FILE", "data/tokens.json"), "proxy API key file (empty disables auth)")
-	modelsCSV := flag.String("models", env("QW_MODELS", "smart,fast,balanced,auto"), "comma-separated model aliases")
-	defaultModel := flag.String("default-model", env("QW_DEFAULT_MODEL", "smart"), "agent mode used when the request model is unknown")
-	timeout := flag.Duration("timeout", 5*time.Minute, "per-request upstream timeout")
-	appVersion := flag.String("app-version", env("QW_APP_VERSION", "1.2.4660"), "appVersion sent in the WS handshake")
-	surface := flag.String("surface", env("QW_SURFACE", "QUICK_WORK_DESKTOP_WINDOWS"), "surfaceType sent in the WS handshake")
-	outpostID := flag.String("outpost-id", env("QW_OUTPOST_ID", ""), "outpostId sent in the WS handshake")
-	workingSessionID := flag.String("working-session-id", env("QW_WORKING_SESSION_ID", ""), "workingSessionId sent in the WS handshake")
-	timezone := flag.String("timezone", env("QW_TIMEZONE", "UTC"), "user_timezone in user_message")
-	locale := flag.String("locale", env("QW_LOCALE", "en-US"), "user_locale in user_message")
-	thinking := flag.String("thinking", env("QW_THINKING_EFFORT", ""), "thinking_effort: off|low|medium|high")
-	keepSessions := flag.Bool("keep-sessions", false, "keep upstream chat sessions instead of deleting them after each request")
-	flag.Parse()
+	os.Exit(run(os.Args[1:]))
+}
 
-	// If the Python helper left an outpost descriptor, pick up its URL/token.
-	if *outpostURL == "" || *tokenFile == "data/instance_token" {
-		if body, err := os.ReadFile("data/outpost.json"); err == nil {
-			var info outpostInfo
-			if json.Unmarshal(body, &info) == nil {
-				if *outpostURL == "" && info.URL != "" {
-					*outpostURL = info.URL
-				}
-				if info.TokenFile != "" {
-					*tokenFile = info.TokenFile
-				}
-			}
+func run(args []string) int {
+	if len(args) == 0 {
+		return serve(nil)
+	}
+	switch args[0] {
+	case "serve":
+		return serve(args[1:])
+	case "login":
+		return login(args[1:])
+	case "accounts", "list":
+		return listAccounts(args[1:])
+	case "refresh":
+		return refreshAccounts(args[1:])
+	case "logout":
+		return logout(args[1:])
+	case "help", "-h", "--help":
+		usage()
+		return 0
+	default:
+		if strings.HasPrefix(args[0], "-") {
+			return serve(args)
 		}
+		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[0])
+		usage()
+		return 2
 	}
+}
 
-	models := make([]string, 0)
-	for _, m := range strings.Split(*modelsCSV, ",") {
-		if m = strings.TrimSpace(m); m != "" {
-			models = append(models, m)
-		}
-	}
-	cfg := &proxy.Config{
-		Addr:              *addr,
-		SessionFile:       *sessionFile,
-		OutpostURL:        strings.TrimRight(*outpostURL, "/"),
-		InstanceTokenFile: *tokenFile,
-		TokensFile:        *tokensFile,
-		Models:            models,
-		DefaultModel:      *defaultModel,
-		Timeout:           *timeout,
-		AppVersion:        *appVersion,
-		Surface:           *surface,
-		OutpostID:         *outpostID,
-		WorkingSessionID:  *workingSessionID,
-		Timezone:          *timezone,
-		Locale:            *locale,
-		ThinkingEffort:    *thinking,
-		KeepSessions:      *keepSessions,
-	}
+func usage() {
+	fmt.Fprint(os.Stderr, `quickwork-openai - Amazon Quick to OpenAI-compatible API
 
+Usage:
+  quickproxy serve    [-config config.json]
+  quickproxy login    [-config config.json] [-provider social|enterprise|gateway|social_gateway]
+                      [-stage prod|beta|integ|dev] [-region REGION] [-port 18080]
+                      [-timeout 1h] [-open]
+  quickproxy accounts [-config config.json]
+  quickproxy refresh  [-config config.json] [-account ID]
+  quickproxy logout   [-config config.json] (-all | -account ID)
+
+Running without a subcommand is equivalent to "serve".
+
+config.json is created with defaults on first use. Accounts are stored in the
+SQLite database named by "database" in config.json. When multiple accounts are
+present, requests rotate through them round-robin.
+`)
+}
+
+func loadConfig(path string) (*config.Config, error) {
+	return config.Load(path)
+}
+
+func openStore(cfg *config.Config) (*store.Store, error) {
+	st, err := store.Open(cfg.Database)
+	if err != nil {
+		return nil, fmt.Errorf("open database %s: %w", cfg.Database, err)
+	}
+	return st, nil
+}
+
+func serve(args []string) int {
+	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	_ = fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+
+	mgr := accounts.New(st, cfg)
+	count, _ := mgr.EnabledCount(context.Background())
+	handler := proxy.NewServer(cfg, mgr).Handler()
 	server := &http.Server{
 		Addr:              cfg.Addr,
-		Handler:           proxy.NewServer(cfg).Handler(),
+		Handler:           handler,
 		ReadHeaderTimeout: 15 * time.Second,
 		IdleTimeout:       120 * time.Second,
 	}
 
-	log.Printf("quickwork-openai listening on %s (session=%s outpost=%s auth=%v)",
-		cfg.Addr, absOrSame(cfg.SessionFile), emptyAs(cfg.OutpostURL, "file"), fileExists(cfg.TokensFile))
+	log.Printf("quickwork-openai listening on %s (config=%s db=%s accounts=%d auth=%v)",
+		cfg.Addr, cfg.Path, cfg.Database, count, len(cfg.APIKeys) > 0)
+	if count == 0 {
+		log.Printf("no accounts stored; run `quickproxy login` to add one")
+	}
 
+	stop, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	listenErr := make(chan error, 1)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("listen: %v", err)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			listenErr <- err
+			cancel()
 		}
 	}()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-	<-stop
+	<-stop.Done()
 	log.Printf("shutting down")
-	_ = server.Close()
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+	_ = server.Shutdown(shutdownCtx)
+	select {
+	case err := <-listenErr:
+		log.Printf("listen: %v", err)
+		return 1
+	default:
+		return 0
+	}
 }
 
-func absOrSame(p string) string {
-	a, err := filepath.Abs(p)
+func login(args []string) int {
+	fs := flag.NewFlagSet("login", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	provider := fs.String("provider", "", "social, enterprise, gateway or social_gateway (default from config)")
+	stage := fs.String("stage", "", "prod, beta, integ or dev (default from config)")
+	region := fs.String("region", "", "IDC region (social) or enterprise discovery region prefix")
+	port := fs.Int("port", 0, "localhost callback port (default from config)")
+	timeout := fs.Duration("timeout", 0, "wait duration for the browser callback (default from config)")
+	open := fs.Bool("open", false, "open the login URL in the default browser")
+	_ = fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
 	if err != nil {
-		return p
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
 	}
-	return a
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+
+	if *provider == "" {
+		*provider = cfg.OAuth.Provider
+	}
+	if *stage == "" {
+		*stage = cfg.OAuth.BuildStage
+	}
+	if *port == 0 {
+		*port = cfg.OAuth.CallbackPort
+	}
+	if *timeout == 0 {
+		*timeout = cfg.OAuth.Timeout.Duration()
+	}
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	logger := log.New(os.Stdout, "[login] ", 0)
+	acct, err := oauth.Login(ctx, oauth.LoginOptions{
+		Provider:    *provider,
+		Stage:       *stage,
+		Region:      *region,
+		Port:        *port,
+		Timeout:     *timeout,
+		AppVersion:  cfg.AppVersion,
+		OpenBrowser: *open,
+		Logf:        logger.Printf,
+	}, st)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "[login] failed:", err)
+		return 1
+	}
+	fmt.Printf("account %d ready: %s (%s, %s)\n", acct.ID, displayAccount(acct), acct.Provider, acct.WSHost)
+	return 0
 }
 
-func emptyAs(v, fallback string) string {
-	if strings.TrimSpace(v) == "" {
-		return fallback
+func listAccounts(args []string) int {
+	fs := flag.NewFlagSet("accounts", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	_ = fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
 	}
-	return v
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+
+	list, err := st.List(context.Background())
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "list accounts:", err)
+		return 1
+	}
+	if len(list) == 0 {
+		fmt.Println("no accounts; run `quickproxy login`")
+		return 0
+	}
+	tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tEMAIL\tPROVIDER\tSTAGE\tREGION\tEXPIRES\tUSES\tSTATUS")
+	now := time.Now()
+	for i := range list {
+		a := &list[i]
+		status := "ready"
+		if a.Disabled {
+			status = "disabled"
+		} else if a.ExpiresAt > 0 && a.ExpiresAt <= now.Unix() {
+			status = "expired"
+		}
+		if a.LastError != "" {
+			status += " (" + a.LastError + ")"
+		}
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\t%s\t%d\t%s\n",
+			a.ID, displayAccount(a), a.Provider, a.BuildStage, a.Region,
+			formatEpoch(a.ExpiresAt), a.UseCount, status)
+	}
+	_ = tw.Flush()
+	return 0
 }
 
-func fileExists(p string) bool {
-	st, err := os.Stat(p)
-	return err == nil && !st.IsDir()
+func refreshAccounts(args []string) int {
+	fs := flag.NewFlagSet("refresh", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	accountID := fs.Int64("account", 0, "refresh only this account ID (default: all)")
+	_ = fs.Parse(args)
+
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+
+	mgr := accounts.New(st, cfg)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	if *accountID > 0 {
+		a, err := mgr.RefreshOne(ctx, *accountID)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "account %d: %v\n", *accountID, err)
+			return 1
+		}
+		fmt.Printf("account %d refreshed: %s expires %s\n", a.ID, displayAccount(a), formatEpoch(a.ExpiresAt))
+		return 0
+	}
+
+	results, err := mgr.RefreshAll(ctx)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "refresh:", err)
+		return 1
+	}
+	if len(results) == 0 {
+		fmt.Println("no accounts; run `quickproxy login`")
+		return 0
+	}
+	failed := 0
+	for _, res := range results {
+		if res.Err != nil {
+			failed++
+			id := int64(0)
+			if res.Account != nil {
+				id = res.Account.ID
+			}
+			fmt.Fprintf(os.Stderr, "account %d: %v\n", id, res.Err)
+			continue
+		}
+		fmt.Printf("account %d refreshed: %s expires %s\n",
+			res.Account.ID, displayAccount(res.Account), formatEpoch(res.Account.ExpiresAt))
+	}
+	if failed > 0 {
+		return 1
+	}
+	return 0
+}
+
+func logout(args []string) int {
+	fs := flag.NewFlagSet("logout", flag.ExitOnError)
+	configPath := fs.String("config", "config.json", "path to config.json")
+	accountID := fs.Int64("account", 0, "delete only this account ID")
+	all := fs.Bool("all", false, "delete every stored account")
+	_ = fs.Parse(args)
+
+	if *accountID <= 0 && !*all {
+		fmt.Fprintln(os.Stderr, "logout requires -all or -account ID")
+		return 2
+	}
+	cfg, err := loadConfig(*configPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "config:", err)
+		return 1
+	}
+	st, err := openStore(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		return 1
+	}
+	defer st.Close()
+
+	ctx := context.Background()
+	if *all {
+		n, err := st.DeleteAll(ctx)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "logout:", err)
+			return 1
+		}
+		fmt.Printf("removed %d account(s)\n", n)
+		return 0
+	}
+	ok, err := st.Delete(ctx, *accountID)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "logout:", err)
+		return 1
+	}
+	if !ok {
+		fmt.Fprintf(os.Stderr, "account %d not found\n", *accountID)
+		return 1
+	}
+	fmt.Printf("removed account %d\n", *accountID)
+	return 0
+}
+
+func displayAccount(a *store.Account) string {
+	for _, v := range []string{a.Email, a.AccountName, a.AWSAccountID} {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return "-"
+}
+
+func formatEpoch(v int64) string {
+	if v <= 0 {
+		return "unknown"
+	}
+	return time.Unix(v, 0).Local().Format("2006-01-02 15:04")
 }
