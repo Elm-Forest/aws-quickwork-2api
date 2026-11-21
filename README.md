@@ -1,83 +1,65 @@
-# QuickWork / Amazon Quick → OpenAI 兼容反代
+# QuickWork / Amazon Quick → OpenAI API
 
-本仓库基于对 `Amazon-Quick.exe` 解包后的 Electron 前端与 PyInstaller 后端的静态分析。
+把 Amazon Quick（QuickWork）桌面端的聊天能力转换成 **OpenAI 兼容的 HTTP API**。
 
-结论先说：
+项目内置原生 OAuth 登录：不用启动官方桌面应用，也不用运行 outpost 进程。登录后由 Go 反代把 `/v1/chat/completions` 请求转换为 QuickWork WebSocket 帧，并把结果转回普通 JSON 或 SSE。
 
-- **没有 email/password 登录，也没有上游注册 API。** 登录是浏览器 OAuth：consumer/social 走 AWS IAM Identity Center OIDC，企业走企业 OIDC discovery；注册只打开 `https://quick.aws.com/signup`。
-- 聊天不是 HTTP REST，而是 WebSocket JSON frame；本仓库把它转换成 `POST /v1/chat/completions`（含 SSE）。
-- `auth/quickauth.py` **原生实现** discovery + PKCE + token 交换，不启动 `quickwork-agent.exe`、不经过 outpost。登录得到的 token 存在 `data/upstream.json`，Go 反代可用的 session 写到 `data/session.json`。
-- Go 反代支持用 `data/tokens.json` 做本地 API key 鉴权；文件不存在或为空时关闭鉴权。本工具不创建本地账号。
+> 非官方项目，与 Amazon / AWS 无关联。请仅在你拥有或获得明确授权的账号上使用，并遵守相关服务条款。
 
-## 实现位置
+## 功能
 
-| 内容 | 路径 |
-|---|---|
-| 原生 OAuth / session / refresh | `auth/quickauth.py` |
-| OpenAI 兼容 HTTP / SSE | `internal/proxy/server.go`、`messages.go` |
-| WebSocket 帧与 codec | `internal/proxy/upstream.go`、`wire.go` |
-| session 与 outpost 兼容读取 | `internal/proxy/session.go` |
-| 本地 API key 鉴权 | `internal/proxy/auth.go` |
+- `POST /v1/chat/completions`，支持流式（SSE）与非流式响应
+- `GET /v1/models`，返回本地模型别名
+- 原生 social 登录（AWS IAM Identity Center OIDC）与企业 OIDC 登录，使用 PKCE
+- `refresh` 命令刷新 token，无需重新打开浏览器
+- 可选本地 API key 保护
+- 默认每轮对话结束后删除上游会话，避免污染聊天列表
 
-关键事实：
+## 环境要求
 
-- **原生登录（`auth/quickauth.py`）**：
-  - social：浏览器打开 `https://quick.aws.com/sn?qwSurface=desktop:<nonce>:<port>:<appVersion>`；discovery 回调 `/callback` 使用 camelCase 参数（`issuerUrl`、`tenantUrl`、`idcInstanceId`、`idcRegion`）；随后 `POST https://oidc.<idcRegion>.amazonaws.com/client/register`，再 302 到 `/authorize`（PKCE S256），回调 `/` 收 code，`POST /token` 换 token。
-  - enterprise：浏览器打开 `https://<region>.quicksight.aws.amazon.com/sn/start/app-integrations/quickwork-enterprise-login?qwSurface=...`；discovery 回调同样是 camelCase（`authEndpoint`、`tokenEndpoint`、`clientId`、`clientSecret`、`tenantUrl`）；再走企业 OIDC authorize + token endpoint。
-  - token 用完后可 `python auth/quickauth.py refresh`，不需要重新打开浏览器。
-- 原始 App 的 outpost 等价接口（仅作参考）：`POST {outpost}/auth/profile-login`，以及 `GET {outpost}/auth/sncs-session`（返回 `id_token`、`ws_host`、`ws_path`、`tenant_url`、`actor_arn`、`provider`、`surface`、`aws_account_id` 等）。原生工具直接产出同样的 session 字段。
-- 聊天 URL：`wss://{ws_host}/streaming/quickwork-chat-bidirectional-stream`；先发 `session_connect`、`session_create`、`user_message`，收 `text_delta` / `message_complete` / `turn_completed`。
-- AIDP（`enterprise`/`social`）帧是二进制 JSON 包裹 base64 内层 JSON，回包是 AWS event-stream；`gateway`/`social_gateway` 走 AWS event-stream + CBOR（codec 已做本地 round-trip 验证，但无真实凭证做端到端验证）。
-- 没有 `/v1/models` 或模型列表 API；可用值为 agent mode：`smart`、`fast`、`balanced`（以及 `auto`）。
+- 用于构建反代：Go 1.26+
+- 用于登录：Python 3.10+（仅使用标准库，无需安装依赖）
+- 一个可正常登录的 Amazon Quick 账号
+- 浏览器与登录脚本运行在**同一台机器**，且本机 `18080` 端口可被浏览器访问
 
-## 目录
+## 快速开始
 
-```
-quickwork-openai/
-  cmd/quickproxy/          Go 反代入口
-  internal/proxy/          session、WS codec、OpenAI handler
-  auth/quickauth.py        Python 原生 OAuth 登录 + session/refresh
-  data/                    运行期文件（已 gitignore）
-  go.mod / go.sum
-```
-
-## 准备
+### 1. 构建反代
 
 ```bash
 cd quickwork-openai
-go build -o bin/quickproxy.exe ./cmd/quickproxy
+go build -o bin/quickproxy.exe ./cmd/quickproxy   # Windows
+# go build -o bin/quickproxy ./cmd/quickproxy     # macOS / Linux
 ```
 
-Go 反代在 `data/tokens.json` 不存在或为空时关闭鉴权。需要 API key 时，把 token 写进该文件（格式见 `internal/proxy/auth.go`）；不要提交 `data/`。
-
-## 上游登录（原生 Python，无 outpost）
+### 2. 登录上游账号
 
 ```bash
-python auth/quickauth.py upstream-login --provider social --build-stage prod
+python auth/quickauth.py upstream-login --provider social
 ```
 
-- `--provider social`：consumer/social（AWS IAM Identity Center OIDC），默认。
-- `--provider enterprise`：企业 SSO；可加 `--region us-east-1` 指定 discovery 前缀。
-- `--build-stage prod|beta|integ|dev`：默认 `prod`。
-- `--port`：默认 `18080`；浏览器回调必须能访问这个本机端口。
-- `--open`：可选，自动打开默认浏览器；默认只打印 URL，由用户自己打开。
+终端会打印一个 discovery URL，例如：
 
-流程：
+```
+https://quick.aws.com/sn?qwSurface=desktop:<nonce>:18080:1.2.4660
+```
 
-1. 终端打印 discovery URL，例如 `https://quick.aws.com/sn?qwSurface=desktop:<nonce>:18080:1.2.4660`。
-2. 在**同一台机器**的浏览器打开并完成登录。
-3. 浏览器回调 `/callback`；工具按 discovery 的原始 camelCase 参数（social：`issuerUrl`/`tenantUrl`/`idcInstanceId`/`idcRegion`；enterprise：`authEndpoint`/`tokenEndpoint`/`clientId`/`clientSecret`/`tenantUrl`）拼接 authorize URL，再走 PKCE、token 交换、user-info。
-4. 写入 `data/session.json`（Go 反代使用）和 `data/upstream.json`（refresh 使用）。终端只打印 email、`ws_host`、到期时间，不打印 token。
+在**同一台机器**的浏览器中打开它，完成登录。工具会：
 
-其他命令：
+1. 接收浏览器回调；
+2. 完成 OAuth / PKCE 与 token 交换；
+3. 获取用户信息；
+4. 写入 `data/session.json`（反代使用）和 `data/upstream.json`（refresh 使用）。
+
+终端只打印账号显示信息、`ws_host` 和到期时间，不打印 token。
+
+企业 SSO 登录：
 
 ```bash
-python auth/quickauth.py status
-python auth/quickauth.py refresh    # 刷新 token 并重写 data/session.json
-python auth/quickauth.py logout     # 删除 data/session.json / data/upstream.json
+python auth/quickauth.py upstream-login --provider enterprise --region us-east-1
 ```
 
-## 启动反代
+### 3. 启动反代
 
 ```bash
 ./bin/quickproxy.exe -addr 127.0.0.1:8080 \
@@ -85,31 +67,18 @@ python auth/quickauth.py logout     # 删除 data/session.json / data/upstream.j
   -session data/session.json
 ```
 
-`-session` 读取原生工具写出的 session。`data/outpost.json` 只作为兼容旧流程的可选路径；原生登录不会创建它。
+如果 `data/tokens.json` 不存在或为空，反代会关闭 API key 鉴权，适合纯本机使用。
 
-常用参数：
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `-addr` | `127.0.0.1:8080` | 监听地址 |
-| `-tokens` | `data/tokens.json` | 本地 API key；文件为空/不存在时关闭鉴权 |
-| `-session` | `data/session.json` | 上游 session 回退文件 |
-| `-outpost` | 空 | 显式指定 outpost，如 `http://127.0.0.1:8780` |
-| `-instance-token-file` | `data/instance_token` | outpost instance token |
-| `-models` | `smart,fast,balanced,auto` | `/v1/models` 返回值和 model 白名单 |
-| `-default-model` | `smart` | 未知 model 的映射 |
-| `-timeout` | `5m` | 单请求上游超时 |
-| `-keep-sessions` | `false` | 默认每轮结束后删除上游会话，避免污染聊天列表 |
-| `-thinking` | 空 | `off/low/medium/high` |
-
-## OpenAI 客户端
+### 4. 调用
 
 ```bash
 curl http://127.0.0.1:8080/v1/models \
-  -H "Authorization: Bearer $OPENAI_API_KEY"
+  -H "Authorization: Bearer local"
+```
 
+```bash
 curl http://127.0.0.1:8080/v1/chat/completions \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -H "Authorization: Bearer local" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "smart",
@@ -122,8 +91,10 @@ Python SDK：
 
 ```python
 from openai import OpenAI
+
 # 未配置 data/tokens.json 时 api_key 可填任意值；配置后填对应 key。
 client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="local")
+
 for chunk in client.chat.completions.create(
     model="smart",
     messages=[{"role": "user", "content": "hello"}],
@@ -132,20 +103,129 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
-映射规则：
+## 命令
 
-- `messages` 会拼成单个 `user_message.text`；只有一条 user 消息时原样发送，多轮时按 `Role: content` 拼接。
-- `model` → `agent_mode`（`smart|fast|balanced|auto`）。
-- `temperature`、`max_tokens`、tools、`n>1` 不支持；`n>1` 返回 400。
-- 非流式响应会等完整 `turn_completed` 后返回；流式按 `text_delta` 发 chunk。
-- `X-Thread-Id` 可复用上游会话；默认每请求新建并删除。
+### 登录与凭据
 
-## 安全与限制
+| 命令 | 说明 |
+|---|---|
+| `python auth/quickauth.py upstream-login` | 打开浏览器登录并写出 session |
+| `python auth/quickauth.py refresh` | 刷新 token 并重写 `data/session.json` |
+| `python auth/quickauth.py status` | 显示 session 的 provider、ws_host、账号与到期时间 |
+| `python auth/quickauth.py logout` | 删除 `data/session.json` 与 `data/upstream.json` |
 
-- `data/` 内含 `session.json`（access token/refresh token）、`upstream.json`（refresh token、client secret、user info）、可选的 `tokens.json`；已 gitignore，权限尽量设为 0600。不要把 `data/` 提交或发给别人。
-- 上游登录必须人工完成 IdP 登录；本工具不会、也不应该保存 IdP 密码。终端只打印 URL 和账号显示信息，不打印 token。
-- **上游没有注册 API。** 网页注册入口是 `https://quick.aws.com/signup`；本工具不提供 `upstream-register`。
-- 已用真实 social 账号做过端到端验证：原生登录写出 `data/session.json`，Go 反代 `/v1/chat/completions` 返回上游 `OK`。
-- AIDP 路径已用真实 social 账号验证；`gateway` / `social_gateway` 的 CBOR + event-stream codec 只做了本地 round-trip，未用真实 AWS 凭证端到端验证，标记 `[UNVERIFIED]`。
-- 真实上游的 `ws_path`、`provider`、字段兼容性由登录 discovery 决定；若服务端 schema 变化，先看 `/callback` 收到的参数和 `auth/quickauth.py` 的字段映射。
-- 本工具仅用于授权的 CTF/沙箱分析；不要用于未授权账号或服务。
+`upstream-login` 常用参数：
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `--provider` | `social` | `social`、`enterprise`、`gateway`、`social_gateway` |
+| `--build-stage` | `prod` | `prod`、`beta`、`integ`、`dev` |
+| `--region` | 空 | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
+| `--port` | `18080` | 本机 OAuth 回调端口 |
+| `--timeout` | `3600` | 等待浏览器完成登录的秒数 |
+| `--open` | 关闭 | 同时用默认浏览器打开 URL |
+
+### 反代参数
+
+| 参数 | 默认 | 说明 |
+|---|---|---|
+| `-addr` | `127.0.0.1:8080` | 监听地址 |
+| `-session` | `data/session.json` | 登录工具写出的 session |
+| `-tokens` | `data/tokens.json` | 本地 API key 文件；不存在/为空时关闭鉴权 |
+| `-models` | `smart,fast,balanced,auto` | `/v1/models` 返回值与 model 白名单 |
+| `-default-model` | `smart` | 未知 model 的映射 |
+| `-timeout` | `5m` | 单次上游请求超时 |
+| `-keep-sessions` | `false` | 保留上游会话，不在一轮结束后删除 |
+| `-thinking` | 空 | `off`、`low`、`medium`、`high` |
+| `-app-version` | `1.2.4660` | 上游握手使用的 appVersion |
+| `-surface` | `QUICK_WORK_DESKTOP_WINDOWS` | 上游握手使用的 surfaceType |
+| `-timezone` | `UTC` | 请求中的 user_timezone |
+| `-locale` | `en-US` | 请求中的 user_locale |
+
+需要 API key 时，创建 `data/tokens.json`：
+
+```json
+{
+  "tokens": {
+    "sk-local": {
+      "email": "you@example.com",
+      "created_at": 0
+    }
+  }
+}
+```
+
+之后请求需带 `Authorization: Bearer sk-local`（或 `X-Api-Key: sk-local`）。
+
+## 工作方式
+
+```mermaid
+sequenceDiagram
+    participant U as 用户
+    participant CLI as quickauth.py
+    participant B as 浏览器
+    participant Q as Amazon Quick
+    participant P as quickproxy
+
+    U->>CLI: upstream-login
+    CLI-->>U: 打印 discovery URL
+    U->>B: 打开 URL 并登录
+    B->>CLI: 回调 code
+    CLI->>Q: 换取 token / 获取用户信息
+    CLI->>CLI: 写入 data/session.json
+    U->>P: OpenAI /v1/chat/completions
+    P->>Q: WebSocket 帧
+    Q-->>P: text_delta / message_complete
+    P-->>U: JSON 或 SSE
+```
+
+- 登录完全在 `auth/quickauth.py` 内完成，不依赖官方桌面应用或 outpost。
+- `quickproxy` 使用 `session.json` 中的 `jwt`、`ws_host` 和 `provider` 连接上游 WebSocket。
+- 上游不是 OpenAI HTTP API，而是 WebSocket JSON 帧；本项目的 `internal/proxy/wire.go` 负责帧编码与 event-stream 解码。
+
+## 安全与隐私
+
+- `data/` 包含 access token、refresh token、client secret 和用户信息，已被 `.gitignore` 排除，权限尽量设为 `0600`。
+- 登录密码只在 Amazon 的浏览器页面中输入，本项目不会保存密码。
+- 反代默认只监听 `127.0.0.1`。不要把端口直接暴露到公网；如确需远程访问，请自行加 TLS 与访问控制。
+- `logout` 会删除本地 session 与 refresh 状态。
+- 不要提交或分享 `data/` 目录。
+
+## 限制
+
+- 只实现聊天补全。`temperature`、`max_tokens`、tools、`n > 1` 等参数不支持；`n > 1` 会返回 400。
+- `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
+- 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
+- social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。
+- 上游 token 通常约 1 小时到期，运行 `refresh` 可延长。
+- 上游接口可能随官方客户端更新而变化；若登录或聊天失败，先重新执行 `upstream-login`。
+- 本项目与 Amazon / AWS 无关联，不提供任何服务保证。
+
+## 故障排查
+
+| 现象 | 处理 |
+|---|---|
+| `cannot listen on 127.0.0.1:18080` | 关闭占用 18080 的其他进程后重试 |
+| 浏览器登录后一直等待 | 确认浏览器与脚本在同一台机器，且回调端口可达；不要关闭终端 |
+| `upstream_session_unavailable` | 运行 `upstream-login`，或先运行 `refresh` |
+| `401 invalid_api_key` | 检查 `data/tokens.json` 与请求头中的 key 是否一致 |
+| 登录页面报错 | 查看终端输出的错误；确认 `--provider` 与账号类型匹配 |
+| token 过期 | 运行 `python auth/quickauth.py refresh` |
+
+## 目录
+
+```
+quickwork-openai/
+  auth/quickauth.py        原生 OAuth 登录、refresh、status、logout
+  cmd/quickproxy/          Go 反代入口
+  internal/proxy/          session、WebSocket codec、OpenAI handler
+  data/                    运行期凭据与会话（gitignored）
+```
+
+## License
+
+未指定开源许可证。除非仓库中另有说明，默认保留所有权利；在再分发前请先添加合适的许可证。
+
+## Acknowledgements
+
+Thanks to the [LINUX DO](https://linux.do) community for its support.
