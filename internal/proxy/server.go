@@ -191,17 +191,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		var replies []ToolCallReply
 		if bridgeActive {
 			text, replies = parseClientToolCalls(text, allowedTools)
+			if len(replies) == 0 {
+				replies = nativeToolReplies(res.ToolCalls, allowedTools)
+			}
 			replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
 		}
 		toolCalls := replyToolCalls(replies)
-		if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
-			errEmpty := errors.New("upstream returned no text or tool calls")
+		if !hasVisibleText(text) && len(toolCalls) == 0 {
+			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
 			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", errEmpty.Error())
 			return
 		}
 		message := map[string]any{"role": "assistant"}
-		if strings.TrimSpace(text) == "" {
+		if !hasVisibleText(text) {
 			message["content"] = nil
 		} else {
 			message["content"] = text
@@ -290,7 +293,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}})
 	}
 
-	sawText := false
+	sawVisibleText := false
 	var bridgeBuffer strings.Builder
 
 	var res ChatResult
@@ -319,7 +322,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 					bridgeBuffer.WriteString(ev.Text)
 					return nil
 				}
-				sawText = true
+				if hasVisibleText(ev.Text) {
+					sawVisibleText = true
+				}
 				writeChunk(map[string]any{"content": ev.Text}, nil)
 			}
 			return nil
@@ -340,7 +345,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		// Nothing reached the client yet; reset per-attempt state and try
 		// the next account in rotation.
-		sawText = false
+		sawVisibleText = false
 		bridgeBuffer.Reset()
 	}
 	if lastErr != nil {
@@ -364,27 +369,30 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	finish := "stop"
 	if bridgeActive {
 		outText, replies := parseClientToolCalls(bridgeBuffer.String(), allowedTools)
+		if len(replies) == 0 {
+			replies = nativeToolReplies(res.ToolCalls, allowedTools)
+		}
 		replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
 		outTools = replyToolCalls(replies)
 		if len(outTools) > 0 {
 			finish = "tool_calls"
-		} else if strings.TrimSpace(outText) == "" {
-			errEmpty := errors.New("upstream returned no text or tool calls")
+		} else if !hasVisibleText(outText) {
+			errEmpty := fmt.Errorf("upstream returned no visible text or tool calls (completion_tokens=%d)", res.Usage.CompletionTokens)
 			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 			writeStreamError(errEmpty.Error())
 			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 			flusher.Flush()
 			return
 		}
-	} else if !sawText {
-		errEmpty := errors.New("upstream returned no text")
+	} else if !sawVisibleText {
+		errEmpty := fmt.Errorf("upstream returned no visible text (completion_tokens=%d)", res.Usage.CompletionTokens)
 		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 		writeStreamError(errEmpty.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
-	if strings.TrimSpace(outText) != "" {
+	if hasVisibleText(outText) {
 		writeChunk(map[string]any{"content": outText}, nil)
 	}
 	for i, tc := range outTools {

@@ -4,7 +4,24 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"unicode"
 )
+
+// hasVisibleText reports whether s contains a non-space, non-format rune.
+// It treats zero-width and other format characters as empty so an upstream
+// response that only emits them is not reported as a successful stop.
+func hasVisibleText(s string) bool {
+	for _, r := range s {
+		if r == 0 || unicode.IsSpace(r) {
+			continue
+		}
+		if unicode.Is(unicode.Cf, r) {
+			continue
+		}
+		return true
+	}
+	return false
+}
 
 // ToolCallReply is a client-side tool call parsed from the model's text.
 type ToolCallReply struct {
@@ -313,6 +330,28 @@ func replyToolCalls(replies []ToolCallReply) []ToolCall {
 				Arguments: r.Arguments,
 			},
 		})
+	}
+	return out
+}
+
+// nativeToolReplies maps upstream-native tool events to client tool calls.
+// Only names the caller declared are exposed.
+func nativeToolReplies(calls []ToolCallState, allowed map[string]bool) []ToolCallReply {
+	out := make([]ToolCallReply, 0, len(calls))
+	for _, call := range calls {
+		name := strings.TrimSpace(call.Name)
+		if name == "" || !allowed[name] {
+			continue
+		}
+		id := strings.TrimSpace(call.ID)
+		if id == "" {
+			id = "call_" + strings.ReplaceAll(uuid(), "-", "")
+		}
+		args := strings.TrimSpace(call.Arguments)
+		if args == "" {
+			args = "{}"
+		}
+		out = append(out, ToolCallReply{ID: id, Name: name, Arguments: args})
 	}
 	return out
 }

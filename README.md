@@ -168,7 +168,7 @@ for chunk in client.chat.completions.create(
 | `surface` | `QUICK_WORK_DESKTOP_WINDOWS` | 上游握手使用的 surfaceType |
 | `outpost_id` / `working_session_id` | 空 | 上游握手可选字段 |
 | `timezone` / `locale` | `UTC` / `en-US` | `user_message` 中的时区与语言 |
-| `thinking_effort` | 空 | `off`、`low`、`medium`、`high` |
+| `thinking_effort` | 空 | `off`、`low`、`medium`、`high`；空=服务端默认，`off` 会显式发送关闭 |
 | `keep_sessions` | `false` | 保留上游会话，不在一轮结束后删除 |
 | `oauth.provider` | `social` | `login` 默认 provider |
 | `oauth.build_stage` | `prod` | `prod`、`beta`、`integ`、`dev` |
@@ -264,17 +264,19 @@ sequenceDiagram
 - 客户端 `tools` / `functions` / `tool_choice` 会原样写入 `system_prompt` 的 `<caller_tool_interface>` 块。该块明确标记为调用方指令；覆盖声明也会保留它，不当作后端提示词丢弃。
 - 模型使用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。解析器同时兼容 `<tool_call>`、`<function_call>` 和整段 JSON（包括 OpenAI `tool_calls` / `function_call` 结构），未知工具名或非法 JSON 会保留为普通文本。
 - 代理把解析结果转成 OpenAI `tool_calls`，但**不执行工具**；客户端执行后把结果作为 `role: tool` 发回，代理再转成文本上下文。
-- 上游原生 `tool_start` / `tool_arguments` / `tool_result` 事件仍被忽略；客户端工具只走上述文本标记协议。
+- 上游原生 `tool_start` / `tool_arguments` / `tool_call` / `message_complete.tool_calls` 也会被收集；如果文本标记没有解析出调用，代理会按客户端声明的工具名把原生事件回退成 `tool_calls`。
+- 上游只输出 thinking、空白或零宽字符时，代理返回明确错误并带上 `completion_tokens`，不再返回空的 `finish_reason=stop`。
 - 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送文本或 `tool_calls`；非流式不受影响。
 - `tool_choice: "none"` 关闭桥接；指定函数时只接受该函数；`parallel_tool_calls=false` 时最多返回一个工具调用。
 
 ### 请求日志
 
-每个聊天请求输出三类日志：请求开始、每次账号尝试、最终结果。最终结果包含状态、账号、上游模型、尝试次数、耗时、token 用量、`finish_reason`、工具调用数和错误信息。
+每个聊天请求输出请求开始、每次账号尝试、最终结果，以及一行上游事件统计。最终结果包含状态、账号、上游模型、尝试次数、耗时、token 用量、`finish_reason`、工具调用数和错误信息。
 
 ```
-chat chatcmpl-... start model=smart upstream_model=smart stream=false messages=2 thread=""
+chat chatcmpl-... start model=smart upstream_model=smart stream=false messages=2 prompt_chars=205 system_chars=40587 thread=""
 chat chatcmpl-... attempt=1/3 account=1:social:user@example.com
+upstream events thread=... counts=map[text_delta:2 text_complete:1 turn_usage:1] text_chars=89 tool_calls=0
 chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart attempts=1 elapsed=1.234s tokens{prompt=1200 completion=56 total=1256 cache_read=1024 cache_write=0} finish=stop tool_calls=0
 ```
 
