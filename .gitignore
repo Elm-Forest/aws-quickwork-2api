@@ -1,0 +1,15 @@
+# Runtime secrets and session state
+data/
+
+# Build output
+bin/
+*.exe
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local artifacts
+page-signup.png
+*.log
