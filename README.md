@@ -15,7 +15,8 @@
 - 可选本地 API key 保护
 - 默认每轮对话结束后删除上游会话，避免污染聊天列表
 - 保留 `assistant.tool_calls` / `role: tool` 历史，客户端工具调用链不会丢上下文
-- 当客户端声明同名 `tools` 时，把上游 `tool_start` / `tool_arguments` / `tool_result` 转成 OpenAI `tool_calls`
+- 客户端 `tools` / `functions` 通过 `<client_tool_call>` 协议桥接；代理返回 OpenAI `tool_calls`，实际执行仍在客户端
+- 上游原生 `tool_start` / `tool_arguments` / `tool_result` 在名称匹配时也会转成 OpenAI `tool_calls`
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
 - `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，不拼进 user 文本，也不做提示词注入
 
@@ -211,9 +212,11 @@ sequenceDiagram
 - 非空 `system_prompt` 会覆盖 QuickWork 服务端基础 system prompt；未提供时保留服务端默认。已验证 social 路径，enterprise / gateway 仍待逐项验证。
 - 不会添加“ignore previous instructions”等额外指令，也不会把 system prompt 塞进 user 文本。
 - 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果，供上游继续推理。
-- 客户端在 `tools` / `functions` 中声明的工具不会由本代理执行。只有上游 agent 调用**同名工具**时，代理才会返回 OpenAI `tool_calls`；其他上游工具调用保持内部执行，只返回最终文本。
-- 非流式响应中，工具调用放在 `choices[0].message.tool_calls`；只有工具调用且没有最终文本时 `finish_reason` 才是 `tool_calls`，否则为 `stop`。
-- 流式响应中，工具调用以一个完整的 `arguments` 块发出；文本继续按 `text_delta` 原样转发。
+- 客户端在 `tools` / `functions` 中声明的工具会以 `<client_tool_protocol>` 追加到 system prompt；模型用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。
+- 代理解析该标记并返回 OpenAI `tool_calls`，但**不执行工具**；客户端执行后把结果作为 `role: tool` 发回，代理再转成文本上下文。
+- 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送 `tool_calls` 或文本；非流式不受影响。
+- `tool_choice: "none"` 会关闭桥接；`tool_choice` 为具体函数时只接受该函数。上游原生工具事件在名称匹配时仍可转成 `tool_calls`。
+- 非流式响应中，工具调用放在 `choices[0].message.tool_calls`；桥接调用或只有工具且没有最终文本时 `finish_reason` 为 `tool_calls`，否则为 `stop`。
 
 ## 安全与隐私
 
@@ -226,7 +229,7 @@ sequenceDiagram
 ## 限制
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
-- 客户端 `tools` / `functions` 不会由代理执行。只有上游 agent 调用同名工具时才会出现 OpenAI `tool_calls`；`tool_choice: "none"` 会隐藏所有工具调用。
+- 工具执行在客户端；代理只负责把模型输出转成 `tool_calls`。桥接使用文本协议，模型偶尔可能不遵守；带工具的流式响应会缓冲到本轮结束。
 - `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息会保留服务端默认提示词。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。

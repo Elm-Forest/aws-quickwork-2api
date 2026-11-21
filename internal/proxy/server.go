@@ -110,6 +110,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if req.ParallelToolCalls != nil {
 		parallelTools = *req.ParallelToolCalls
 	}
+	bridgePrompt := buildToolBridgePrompt(req.Tools, req.Functions, choiceMode, choiceName, parallelTools)
+	bridgeActive := bridgePrompt != ""
+	if bridgeActive {
+		if strings.TrimSpace(systemPromptText) != "" {
+			systemPromptText += "\n\n" + bridgePrompt
+		} else {
+			systemPromptText = bridgePrompt
+		}
+	}
+	bridgeAllowed := allowedTools
+	if choiceMode == "function" && choiceName != "" {
+		bridgeAllowed = map[string]bool{choiceName: true}
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.Timeout)
 	defer cancel()
@@ -139,22 +152,33 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", err.Error())
 			return
 		}
-		toolCalls := filterToolCalls(res.ToolCalls, allowedTools, choiceMode, choiceName, parallelTools)
-		if strings.TrimSpace(res.Text) == "" && len(toolCalls) == 0 {
+		text := res.Text
+		var bridgeReplies []ToolCallReply
+		if bridgeActive {
+			text, bridgeReplies = parseClientToolCalls(text, bridgeAllowed)
+			if !parallelTools && len(bridgeReplies) > 1 {
+				bridgeReplies = bridgeReplies[:1]
+			}
+		}
+		toolCalls := replyToolCalls(bridgeReplies)
+		if len(toolCalls) == 0 {
+			toolCalls = filterToolCalls(res.ToolCalls, allowedTools, choiceMode, choiceName, parallelTools)
+		}
+		if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no text or tool calls")
 			return
 		}
 		message := map[string]any{"role": "assistant"}
-		if strings.TrimSpace(res.Text) == "" {
+		if strings.TrimSpace(text) == "" {
 			message["content"] = nil
 		} else {
-			message["content"] = res.Text
+			message["content"] = text
 		}
 		if len(toolCalls) > 0 {
 			message["tool_calls"] = toolCalls
 		}
 		finish := "stop"
-		if strings.TrimSpace(res.Text) == "" && len(toolCalls) > 0 {
+		if len(bridgeReplies) > 0 || (strings.TrimSpace(text) == "" && len(toolCalls) > 0) {
 			finish = "tool_calls"
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
@@ -216,6 +240,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	sawText := false
 	sawTool := false
+	var bridgeBuffer strings.Builder
 	toolIndex := 0
 	toolIndexes := make(map[string]int)
 	sentArgs := make(map[string]string)
@@ -277,13 +302,23 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if ev.Text == "" {
 				return nil
 			}
+			if bridgeActive {
+				bridgeBuffer.WriteString(ev.Text)
+				return nil
+			}
 			sawText = true
 			writeChunk(map[string]any{"content": ev.Text}, nil)
 		case "tool_call":
+			if bridgeActive {
+				return nil
+			}
 			if ev.ToolCall != nil {
 				emitTool(*ev.ToolCall)
 			}
 		case "tool_call_update":
+			if bridgeActive {
+				return nil
+			}
 			if ev.ToolCall != nil {
 				emitTool(*ev.ToolCall)
 			}
@@ -292,6 +327,51 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		writeStreamError(err.Error())
+		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+		flusher.Flush()
+		return
+	}
+	if bridgeActive {
+		text, replies := parseClientToolCalls(bridgeBuffer.String(), bridgeAllowed)
+		if !parallelTools && len(replies) > 1 {
+			replies = replies[:1]
+		}
+		if len(replies) > 0 {
+			if strings.TrimSpace(text) != "" {
+				writeChunk(map[string]any{"content": text}, nil)
+			}
+			for i, reply := range replies {
+				writeChunk(map[string]any{"tool_calls": []map[string]any{{
+					"index": i,
+					"id":    reply.ID,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      reply.Name,
+						"arguments": reply.Arguments,
+					},
+				}}}, nil)
+			}
+			writeChunk(map[string]any{}, "tool_calls")
+		} else {
+			if strings.TrimSpace(text) == "" {
+				writeStreamError("upstream returned no text or tool calls")
+				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+				flusher.Flush()
+				return
+			}
+			writeChunk(map[string]any{"content": text}, nil)
+			writeChunk(map[string]any{}, "stop")
+		}
+		if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
+			writePayload(map[string]any{
+				"id":      id,
+				"object":  "chat.completion.chunk",
+				"created": created,
+				"model":   model,
+				"choices": []any{},
+				"usage":   usageMap(res.Usage),
+			})
+		}
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
