@@ -3,6 +3,7 @@ data/
 
 # Build output
 bin/
+dist/
 *.exe
 
 # Python
