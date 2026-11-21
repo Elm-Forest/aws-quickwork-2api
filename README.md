@@ -224,7 +224,7 @@ quickwork-openai/
 
 ## License
 
-未指定开源许可证。除非仓库中另有说明，默认保留所有权利；在再分发前请先添加合适的许可证。
+本项目采用 [GNU General Public License v3.0](LICENSE) 授权。
 
 ## Acknowledgements
 
