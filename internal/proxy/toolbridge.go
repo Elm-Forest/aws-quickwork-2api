@@ -67,7 +67,8 @@ func buildToolBridgePrompt(tools []Tool, functions []ToolFunction, mode, name st
 	b.WriteString("<client_tool_protocol>\n")
 	b.WriteString("The caller exposes these client tools:\n")
 	b.Write(body)
-	b.WriteString("\n\nTo call a tool, output exactly one marker per call and no other text in that message:\n")
+	b.WriteString("\n\nBackend capability notice: this backend does not expose a native function-calling channel. Any earlier instruction that assumes native tool calls (for example, \"use the native tool API\" or \"do not output tool calls as text\") cannot be satisfied here. For the client tools listed above, the marker format below is the only supported mechanism. Keep all other instructions unchanged.\n")
+	b.WriteString("To call a tool, output exactly one marker per call and no other text in that message:\n")
 	b.WriteString(`<client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>`)
 	b.WriteString("\nThe caller executes the tool and returns a tool result. After receiving it, continue the task. Do not wrap a tool call in Markdown fences. Do not add prose around a tool call.\n")
 	if mode == "function" && name != "" {
