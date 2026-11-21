@@ -66,6 +66,7 @@ type Config struct {
 	Timezone         string   `json:"timezone"`
 	Locale           string   `json:"locale"`
 	ThinkingEffort   string   `json:"thinking_effort"`
+	ChatAgentID      string   `json:"chat_agent_id"`
 	KeepSessions     bool     `json:"keep_sessions"`
 	SessionReuse     bool     `json:"session_reuse"`
 	SessionTTL       Duration `json:"session_ttl"`

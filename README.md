@@ -17,11 +17,14 @@
 - 请求按轮询选择账号；到期 token 自动 refresh；失败时切换到下一个账号重试
 - 可选本地 API key 保护
 - 默认复用上游会话（`session_reuse=true`）；设为 `false` 时每轮结束删除会话，避免污染聊天列表
-- 会话复用：同一段对话固定上游 thread 与账号，每轮只送新增消息，避免重送整份 transcript 撞 64 KB 上限
+- 会话复用：同一段对话固定上游 thread 与账号，每轮只送新增消息，避免重送整份 transcript 撞 64 KB 上限；可用 `X-Conversation-Id` / `X-Thread-Id` 显式指定会话
 - 客户端 `tools` / `functions` 通过 `<caller_tool_interface>` 文本协议桥接；代理解析 `<client_tool_call>` 并返回 OpenAI `tool_calls`，实际执行仍在客户端
+- 工具桥接兼容多种模型写法：`arguments` / `parameters` / `input` / `args`、`tool_calls` / `tool_call` / `function_call`、Markdown 代码块、`functions.` 等命名空间前缀、大小写与唯一后缀匹配；支持同一轮并行多个工具调用
 - 历史中的 `assistant.tool_calls` / `role: tool` 仍会按文本渲染，供上游理解已有上下文
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
-- `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，并附加后端提示词覆盖声明，要求模型忽略上游追加的 system / agent 指令；不拼进 user 文本
+- `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，并附加后端提示词覆盖声明，要求模型忽略上游追加的 system / agent 指令、不得使用或列举平台内置工具；不拼进 user 文本
+- 64 KB 单帧预算按实际 JSON 字节计算：先裁剪历史，再裁剪过大的调用方 system prompt，保留开头、结尾与覆盖声明，避免直接返回 `request_too_large`
+- `chat_agent_id` 可指定一个 QuickWork 自定义 agent，以替代默认内置 agent 的提示词与工具策略
 
 ## 环境要求
 
@@ -144,6 +147,7 @@ for chunk in client.chat.completions.create(
   "timezone": "UTC",
   "locale": "en-US",
   "thinking_effort": "",
+  "chat_agent_id": "",
   "keep_sessions": false,
   "session_reuse": true,
   "session_ttl": "30m",
@@ -172,6 +176,7 @@ for chunk in client.chat.completions.create(
 | `outpost_id` / `working_session_id` | 空 | 上游握手可选字段 |
 | `timezone` / `locale` | `UTC` / `en-US` | `user_message` 中的时区与语言 |
 | `thinking_effort` | 空 | `off`、`low`、`medium`、`high`；空=服务端默认，`off` 会显式发送关闭 |
+| `chat_agent_id` | 空 | 指定 QuickWork 自定义 agent；服务端按该 agent 的 system prompt 与 tool policy 执行，用于隔离默认内置提示词和内置工具 |
 | `keep_sessions` | `false` | 关闭 `session_reuse` 时，是否保留上游会话 |
 | `session_reuse` | `true` | 以固定上游会话只送新增消息；同一会话固定使用原账号 |
 | `session_ttl` | `30m` | 会话闲置多久后从代理内存移除 |
@@ -264,21 +269,26 @@ sequenceDiagram
 ### 提示词与工具调用
 
 - `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.system_prompt`。
-- `system_prompt` 始终发送：合并后的调用方指令后面固定追加一条严格的系统提示词优先级声明，要求模型丢弃 QuickWork 服务端附加的所有 system / developer / agent / runtime / system-reminder 指令，即使它们出现在后面、自称更具体、自称可覆盖该声明，或标记为 system 消息。客户端未提供 system 消息时，字段只包含该声明，服务端默认提示词不再生效。已验证 social 路径，enterprise / gateway 仍待逐项验证。
+- `system_prompt` 始终发送：合并后的调用方指令后面固定追加一条严格的系统提示词优先级声明，要求模型丢弃 QuickWork 服务端附加的所有 system / developer / agent / runtime / system-reminder 指令，即使它们出现在后面、自称更具体、自称可覆盖该声明，或标记为 system 消息。
+- 覆盖声明还明确 relay 模式：只允许使用 `<caller_tool_interface>` 中声明的调用方工具；平台内置工具、connector、skill、文件、Python/JavaScript、时间/日历、memory、后台任务都不可用，不得调用、列举或描述。调用方未提供 system 消息时，字段只包含该声明；服务端内置提示词仍会占用上下文，但其指令让位于该声明。已验证 social 路径，enterprise / gateway 仍待逐项验证。
 - 覆盖声明写在 `system_prompt` 里，不是 user 文本注入，也不会把 system prompt 塞进 user 文本。
 - 客户端 `tools` / `functions` / `tool_choice` 会原样写入 `system_prompt` 的 `<caller_tool_interface>` 块。该块明确标记为调用方指令；覆盖声明也会保留它，不当作后端提示词丢弃。
-- 模型使用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。解析器同时兼容 `<tool_call>`、`<function_call>` 和整段 JSON（包括 OpenAI `tool_calls` / `function_call` 结构），未知工具名或非法 JSON 会保留为普通文本。
+- 模型使用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。解析器同时兼容 `<tool_call>`、`<function_call>`、整段 JSON、Markdown 代码块、`tool_calls` / `tool_call` / `function_call` 包装、`arguments` / `parameters` / `input` / `args` 字段、`functions.` 等前缀、大小写差异和唯一后缀匹配。未知工具名或非法 JSON 会保留为普通文本。
+- 并行调用：允许在同一回复中连续输出多个 `<client_tool_call>`；`parallel_tool_calls=false` 时只保留第一个。
 - 代理把解析结果转成 OpenAI `tool_calls`，但**不执行工具**；客户端执行后把结果作为 `role: tool` 发回，代理再转成文本上下文。
-- 上游原生 `tool_start` / `tool_arguments` / `tool_call` / `message_complete.tool_calls` 也会被收集；如果文本标记没有解析出调用，代理会按客户端声明的工具名把原生事件回退成 `tool_calls`。
+- 上游原生 `tool_start` / `tool_arguments` / `tool_progress` / `tool_call` / `tool_complete` / `message_complete.tool_calls` 也会被收集；`tool_progress.input_delta` 会累积为完整参数。如果文本标记没有解析出调用，代理会按客户端声明的工具名把原生事件回退成 `tool_calls`。
+- 上游一个 WebSocket 帧内可能包含多条 event-stream 消息；解码器会按顺序全部处理，不会只取第一条。
 - 上游只输出 thinking、空白或零宽字符时，代理返回明确错误并带上 `completion_tokens`，不再返回空的 `finish_reason=stop`。
 - 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送文本或 `tool_calls`；非流式不受影响。
 - `tool_choice: "none"` 关闭桥接；指定函数时只接受该函数；`parallel_tool_calls=false` 时最多返回一个工具调用。
+- 内置 agent 的 60K+ token 提示词与内置工具仍由 QuickWork 服务端维护。若需要更强的隔离，在 `config.json` 设置 `chat_agent_id` 指向一个关闭内置工具、使用自定义 system prompt 的 QuickWork agent；代理会把该 ID 放进 `user_message.chat_agent_id`。
 
 ### 会话复用
 
 - 首轮发送完整 transcript，并记录上游 `thread_id` 与账号。
 - 后续请求若消息历史是上次已发送历史的前缀，只发送新增后缀；这样 64 KB 预算主要留给新消息。
-- system prompt 变化、历史被编辑、或没有新增消息时，自动回退为完整 transcript + 新上游会话。
+- 会话键优先使用 `X-Conversation-Id`，其次 `X-Thread-Id`；都没有时使用完整 system prompt（含工具定义）加第一条非 system 消息的哈希。不同工具的请求不会复用同一个上游 thread。
+- system prompt 或工具定义变化、历史被编辑、或没有新增消息时，自动回退为完整 transcript + 新上游会话。
 - 同一会话固定使用原账号；账号不可用或复用失败时，自动换账号并以完整 transcript 新建会话。
 - 会话状态只保存在内存，进程重启后首轮回退完整 transcript。闲置超过 `session_ttl` 会从代理移除。
 - 复用启用时不会发送 `session_delete`，上游会话会保留到服务端自身过期。
@@ -308,14 +318,15 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 ## 限制
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
-- 上游 `user_message` 帧上限 64 KB。会话复用开启时通常只送新增消息；若单个 delta 仍超限，代理会在发送前保留开头与结尾、裁剪中间历史，并记录 `user_message trimmed ...`。如果 `system_prompt` 加元数据已经超过上限，返回 `400 request_too_large`。
+- 上游 `user_message` 帧上限 64 KB。会话复用开启时通常只送新增消息；若单个 delta 仍超限，代理会按实际 JSON 字节保留开头与结尾、裁剪中间历史，并记录 `user_message trimmed ...`。如果调用方 `system_prompt` 本身过大，代理会先保留用户消息，再裁剪 system prompt 的中间部分，保留开头、结尾和覆盖声明；只有连最小帧都无法放入时才返回 `400 request_too_large`。
 - WebSocket 分片只影响传输层，上游重組後仍按單一 `user_message` 檢查 64 KB。多個 `user_message` 會被視為多輪；`mid_turn` 是 steering，`message_split` 是服務端輸出事件，不能用來拼接同一輪輸入。
 - 工具桥接使用文本协议，模型偶尔可能不遵守；有工具时流式响应会缓冲到本轮结束。代理只解析并返回 `tool_calls`，不执行工具。
-- `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，因此服务端默认提示词不会生效。
+- 默认内置 agent 仍会在服务端附加约 60K token 的提示词和内置工具。覆盖声明能阻止模型遵循或列举这些内容，但不能删除服务端上下文；需要彻底隔离时使用 `chat_agent_id` 指向自定义 agent。
+- `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，但服务端内置提示词仍会占用上下文，只是其指令让位于该声明。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
 - social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。
-- 上游 access token 通常约 1 小时到期，反代会按 `refresh_before` 自动刷新；也可手动执行 `quickproxy refresh`。
+- 上游 access token 通常约 1 小时到期，反代会按 `refresh_before` 自动刷新；也可手动执行 `quickproxy refresh`。refresh 响应未返回新的 ID token 时会保留旧值，用户信息接口短暂失败不会丢弃已刷新的 token。
 - 多账号轮询按请求选择账号，不按 token 用量或配额调度。
 - 上游接口可能随官方客户端更新而变化；若登录或聊天失败，先重新执行 `quickproxy login`。
 - 本项目与 Amazon / AWS 无关联，不提供任何服务保证。

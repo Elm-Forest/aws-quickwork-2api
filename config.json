@@ -19,6 +19,7 @@
   "timezone": "UTC",
   "locale": "en-US",
   "thinking_effort": "",
+  "chat_agent_id": "",
   "keep_sessions": false,
   "session_reuse": true,
   "session_ttl": "30m",

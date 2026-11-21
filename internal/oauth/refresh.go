@@ -3,7 +3,6 @@ package oauth
 import (
 	"context"
 	"errors"
-	"fmt"
 	"net/url"
 	"strings"
 
@@ -77,9 +76,18 @@ func Refresh(ctx context.Context, a *store.Account) (*store.Account, error) {
 		TenantURL: out.TenantURL,
 		Region:    out.Region,
 	}
-	info, err := fetchUserInfo(ctx, provider, out.BuildStage, d, out.TenantURL, t.AccessToken)
-	if err != nil {
-		return nil, fmt.Errorf("user info after refresh: %w", err)
+	info, infoErr := fetchUserInfo(ctx, provider, out.BuildStage, d, out.TenantURL, t.AccessToken)
+	if infoErr != nil {
+		// The token endpoint already accepted the refresh. Do not throw away
+		// a valid session because the profile endpoint is transiently down;
+		// keep the identity fields already stored.
+		info = UserInfo{
+			Email:        out.Email,
+			DisplayName:  out.DisplayName,
+			UserARN:      out.ActorARN,
+			AWSAccountID: out.AWSAccountID,
+			AccountName:  out.AccountName,
+		}
 	}
 	if err := applySession(&out, t, info); err != nil {
 		return nil, err

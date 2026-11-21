@@ -380,39 +380,58 @@ func aidpEncode(jsonStr string) []byte {
 	return outer
 }
 
-func aidpDecode(data []byte) (string, error) {
+func aidpDecode(data []byte) ([]string, error) {
 	msgs, _, err := eventStreamDecodeAll(data)
-	if err != nil || len(msgs) == 0 {
+	if len(msgs) == 0 {
 		// Some servers may answer with a plain JSON text frame.
 		var probe map[string]any
 		if json.Unmarshal(data, &probe) == nil {
-			return string(data), nil
+			return []string{string(data)}, nil
 		}
-		return "", fmt.Errorf("decode AIDP event-stream: %v", err)
+		return nil, fmt.Errorf("decode AIDP event-stream: %v", err)
 	}
-	msg := msgs[0]
-	if mt := headerString(msg.Headers, ":message-type"); mt == "error" || mt == "exception" {
-		code := headerString(msg.Headers, ":error-code")
-		if code == "" {
-			code = headerString(msg.Headers, ":exception-type")
+	out := make([]string, 0, len(msgs))
+	var firstErr error
+	for _, msg := range msgs {
+		if mt := headerString(msg.Headers, ":message-type"); mt == "error" || mt == "exception" {
+			code := headerString(msg.Headers, ":error-code")
+			if code == "" {
+				code = headerString(msg.Headers, ":exception-type")
+			}
+			detail := headerString(msg.Headers, ":error-message")
+			if firstErr == nil {
+				firstErr = fmt.Errorf("upstream error [%s] %s", code, detail)
+			}
+			continue
 		}
-		detail := headerString(msg.Headers, ":error-message")
-		return "", fmt.Errorf("upstream error [%s] %s", code, detail)
+		var outer struct {
+			Payload string `json:"payload"`
+		}
+		if err := json.Unmarshal(msg.Payload, &outer); err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("decode AIDP body: %w", err)
+			}
+			continue
+		}
+		if outer.Payload == "" {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("AIDP body has no payload")
+			}
+			continue
+		}
+		inner, err := base64.StdEncoding.DecodeString(outer.Payload)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("decode AIDP payload base64: %w", err)
+			}
+			continue
+		}
+		out = append(out, string(inner))
 	}
-	var outer struct {
-		Payload string `json:"payload"`
+	if len(out) == 0 && firstErr == nil {
+		firstErr = err
 	}
-	if err := json.Unmarshal(msg.Payload, &outer); err != nil {
-		return "", fmt.Errorf("decode AIDP body: %w", err)
-	}
-	if outer.Payload == "" {
-		return "", fmt.Errorf("AIDP body has no payload")
-	}
-	inner, err := base64.StdEncoding.DecodeString(outer.Payload)
-	if err != nil {
-		return "", fmt.Errorf("decode AIDP payload base64: %w", err)
-	}
-	return string(inner), nil
+	return out, firstErr
 }
 
 // ---------------------------------------------------------------------------
@@ -433,36 +452,54 @@ func gatewayEncode(jsonStr string) []byte {
 	}, inner)
 }
 
-func gatewayDecode(data []byte) (string, error) {
+func gatewayDecode(data []byte) ([]string, error) {
 	msgs, _, err := eventStreamDecodeAll(data)
-	if err != nil || len(msgs) == 0 {
-		return "", fmt.Errorf("decode gateway event-stream: %v", err)
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("decode gateway event-stream: %v", err)
 	}
-	msg := msgs[0]
-	if mt := headerString(msg.Headers, ":message-type"); mt == "error" || mt == "exception" {
-		code := headerString(msg.Headers, ":error-code")
-		if code == "" {
-			code = headerString(msg.Headers, ":exception-type")
+	out := make([]string, 0, len(msgs))
+	var firstErr error
+	for _, msg := range msgs {
+		if mt := headerString(msg.Headers, ":message-type"); mt == "error" || mt == "exception" {
+			code := headerString(msg.Headers, ":error-code")
+			if code == "" {
+				code = headerString(msg.Headers, ":exception-type")
+			}
+			detail := headerString(msg.Headers, ":error-message")
+			if firstErr == nil {
+				firstErr = fmt.Errorf("upstream error [%s] %s", code, detail)
+			}
+			continue
 		}
-		detail := headerString(msg.Headers, ":error-message")
-		return "", fmt.Errorf("upstream error [%s] %s", code, detail)
+		val, err := cborDecode(msg.Payload)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("decode gateway CBOR: %w", err)
+			}
+			continue
+		}
+		m, ok := val.(map[string]any)
+		if !ok {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("gateway CBOR is not a map")
+			}
+			continue
+		}
+		switch inner := m["payload"].(type) {
+		case []byte:
+			out = append(out, string(inner))
+		case string:
+			out = append(out, inner)
+		default:
+			if firstErr == nil {
+				firstErr = fmt.Errorf("gateway CBOR has no payload")
+			}
+		}
 	}
-	val, err := cborDecode(msg.Payload)
-	if err != nil {
-		return "", fmt.Errorf("decode gateway CBOR: %w", err)
+	if len(out) == 0 && firstErr == nil {
+		firstErr = err
 	}
-	m, ok := val.(map[string]any)
-	if !ok {
-		return "", fmt.Errorf("gateway CBOR is not a map")
-	}
-	switch inner := m["payload"].(type) {
-	case []byte:
-		return string(inner), nil
-	case string:
-		return inner, nil
-	default:
-		return "", fmt.Errorf("gateway CBOR has no payload")
-	}
+	return out, firstErr
 }
 
 func isGatewayProvider(provider string) bool {

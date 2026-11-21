@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/gorilla/websocket"
 
@@ -42,6 +43,7 @@ type ChatInput struct {
 	ThreadID      string
 	Title         string
 	SystemPrompt  string
+	ChatAgentID   string
 	CreateSession bool
 	DeleteSession bool
 }
@@ -217,6 +219,9 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		"panel_edits":        []any{},
 		"custom_prompt":      nil,
 	}
+	if id := strings.TrimSpace(in.ChatAgentID); id != "" {
+		payload["chat_agent_id"] = id
+	}
 	// system_prompt is the native per-turn override. It always carries the
 	// caller's system/developer instructions plus the backend-prompt override
 	// notice, so instructions the service attaches to the turn lose precedence.
@@ -322,6 +327,8 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 	toolCalls := make(map[string]*ToolCallState)
 	toolOrder := make([]string, 0, 2)
 	toolSent := make(map[string]bool)
+	rawArgs := make(map[string]string)
+	argsPartial := make(map[string]bool)
 
 	getTool := func(id, name string) *ToolCallState {
 		id = strings.TrimSpace(id)
@@ -339,6 +346,28 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 		}
 		return tc
 	}
+	setToolArgs := func(tc *ToolCallState, raw json.RawMessage) {
+		if tc == nil || len(raw) == 0 {
+			return
+		}
+		rawArgs[tc.ID] = rawArgumentText(raw)
+		argsPartial[tc.ID] = false
+		tc.Arguments = normalizeArguments(raw)
+	}
+	appendToolArgs := func(tc *ToolCallState, delta string) {
+		if tc == nil || delta == "" {
+			return
+		}
+		// tool_progress carries an input fragment. Once a tool has been
+		// finalized by tool_arguments/tool_call, later progress deltas are
+		// ignored instead of corrupting the JSON.
+		if !argsPartial[tc.ID] && strings.TrimSpace(tc.Arguments) != "{}" && strings.TrimSpace(tc.Arguments) != "" {
+			return
+		}
+		rawArgs[tc.ID] += delta
+		argsPartial[tc.ID] = true
+		tc.Arguments = normalizeArguments(json.RawMessage(rawArgs[tc.ID]))
+	}
 	emitTool := func(tc *ToolCallState) error {
 		if tc == nil || onEvent == nil || toolSent[tc.ID] {
 			return nil
@@ -355,6 +384,9 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			tc := toolCalls[id]
 			if tc == nil {
 				continue
+			}
+			if raw := strings.TrimSpace(rawArgs[id]); raw != "" {
+				tc.Arguments = normalizeArguments(json.RawMessage(raw))
 			}
 			if strings.TrimSpace(tc.Name) == "" {
 				tc.Name = "unknown"
@@ -381,6 +413,7 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 		"stream_ended":   true,
 		"chat_complete":  true,
 	}
+	var pendingFrames []string
 	for {
 		select {
 		case <-ctx.Done():
@@ -396,33 +429,43 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				return finish()
 			}
 		}
-		_ = conn.SetReadDeadline(time.Now().Add(readWait))
-		msgType, data, err := conn.ReadMessage()
-		if err != nil {
-			res, emitErr := finish()
-			if emitErr != nil {
-				return res, emitErr
-			}
-			if text.Len() > 0 || len(toolOrder) > 0 {
-				return res, nil
-			}
-			return res, fmt.Errorf("upstream WebSocket read: %w", err)
-		}
-
-		var jsonStr string
-		if msgType == websocket.TextMessage {
-			jsonStr = string(data)
-		} else {
-			if gateway {
-				jsonStr, err = gatewayDecode(data)
-			} else {
-				jsonStr, err = aidpDecode(data)
-			}
+		if len(pendingFrames) == 0 {
+			_ = conn.SetReadDeadline(time.Now().Add(readWait))
+			msgType, data, err := conn.ReadMessage()
 			if err != nil {
-				log.Printf("upstream frame decode: %v", err)
-				continue
+				res, emitErr := finish()
+				if emitErr != nil {
+					return res, emitErr
+				}
+				if text.Len() > 0 || len(toolOrder) > 0 {
+					return res, nil
+				}
+				return res, fmt.Errorf("upstream WebSocket read: %w", err)
+			}
+			if msgType == websocket.TextMessage {
+				pendingFrames = append(pendingFrames, string(data))
+			} else {
+				var frames []string
+				if gateway {
+					frames, err = gatewayDecode(data)
+				} else {
+					frames, err = aidpDecode(data)
+				}
+				if err != nil {
+					log.Printf("upstream frame decode: %v", err)
+					if len(frames) == 0 {
+						res, emitErr := finish()
+						if emitErr != nil {
+							return res, emitErr
+						}
+						return res, err
+					}
+				}
+				pendingFrames = append(pendingFrames, frames...)
 			}
 		}
+		jsonStr := pendingFrames[0]
+		pendingFrames = pendingFrames[1:]
 
 		var env struct {
 			Type      string          `json:"type"`
@@ -497,14 +540,37 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				id = p.ToolCallID
 			}
 			tc := getTool(id, p.ToolName)
-			if len(p.Arguments) > 0 {
-				tc.Arguments = normalizeArguments(p.Arguments)
-			}
+			setToolArgs(tc, p.Arguments)
 			if err := emitTool(tc); err != nil {
 				res, _ := finish()
 				return res, err
 			}
-		case "tool_call", "tool_call_update":
+		case "tool_progress":
+			var p struct {
+				ToolID     string `json:"tool_id"`
+				ToolCallID string `json:"tool_call_id"`
+				ToolName   string `json:"tool_name"`
+				InputDelta string `json:"input_delta"`
+				Progress   struct {
+					InputDelta string `json:"input_delta"`
+				} `json:"progress"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			tc := getTool(id, p.ToolName)
+			delta := p.InputDelta
+			if delta == "" {
+				delta = p.Progress.InputDelta
+			}
+			appendToolArgs(tc, delta)
+			if err := emitTool(tc); err != nil {
+				res, _ := finish()
+				return res, err
+			}
+		case "tool_call", "tool_call_update", "tool_complete":
 			var p struct {
 				ToolCallID      string          `json:"toolCallId"`
 				ToolCallIDSnake string          `json:"tool_call_id"`
@@ -535,9 +601,7 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			if len(args) == 0 {
 				args = p.Arguments
 			}
-			if len(args) > 0 {
-				tc.Arguments = normalizeArguments(args)
-			}
+			setToolArgs(tc, args)
 			if err := emitTool(tc); err != nil {
 				res, _ := finish()
 				return res, err
@@ -576,9 +640,7 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				if len(args) == 0 {
 					args = item.Function.Arguments
 				}
-				if len(args) > 0 {
-					tc.Arguments = normalizeArguments(args)
-				}
+				setToolArgs(tc, args)
 				if err := emitTool(tc); err != nil {
 					res, _ := finish()
 					return res, err
@@ -696,7 +758,10 @@ func truncateText(s string, max int) string {
 // Upstream checks the reassembled user_message JSON, so WebSocket
 // fragmentation or multiple user_message frames cannot carry one oversized
 // turn: extra frames would become separate turns. Trim within the single frame
-// instead, keeping the beginning and the most recent tail.
+// instead. Prompt text is trimmed first; if a caller's system prompt alone
+// cannot fit, it is trimmed too, preserving the leading instructions and the
+// trailing authority notice. Trimming is byte-based because the upstream limit
+// is bytes, not runes.
 func fitUserMessage(payload map[string]any) error {
 	wrap := func() ([]byte, error) {
 		return json.Marshal(map[string]any{"type": "user_message", "payload": payload})
@@ -710,38 +775,101 @@ func fitUserMessage(payload map[string]any) error {
 	}
 	original := len(body)
 	text, _ := payload["text"].(string)
-	if text == "" {
-		return fmt.Errorf("%w: system_prompt and metadata alone are %d bytes", ErrUserMessageTooLarge, len(body))
-	}
-	const marker = "\n\n[earlier conversation trimmed to fit the upstream 64 KB frame limit]\n\n"
-	bodyText := text
-	for range 5 {
-		over := len(body) - maxUserMessageBytes
-		runes := []rune(bodyText)
-		keep := len(runes) - over - len(marker) - 512
-		if keep < 0 {
-			keep = 0
-		}
-		head := keep / 4
-		if head > len(runes) {
-			head = len(runes)
-		}
-		rest := keep - head
-		if rest > len(runes)-head {
-			rest = len(runes) - head
-		}
-		bodyText = string(runes[:head]) + marker + string(runes[len(runes)-rest:])
-		payload["text"] = bodyText
-		body, err = wrap()
-		if err != nil {
+	system, _ := payload["system_prompt"].(string)
+
+	// 1. History/prompt text is the normal overflow source. Keep a small user
+	// prompt intact and trim the system prompt instead.
+	if len(text) > 4096 {
+		payload["text"] = shrinkToLimit(text, func(s string) ([]byte, error) {
+			payload["text"] = s
+			return wrap()
+		}, textTrimMarker)
+		if body, err = wrap(); err != nil {
 			return err
 		}
-		if len(body) <= maxUserMessageBytes {
-			log.Printf("user_message trimmed %d -> %d bytes (limit %d)", original, len(body), maxUserMessageBytes)
-			return nil
+	}
+
+	// 2. A large caller system prompt is also bounded by the same frame.
+	if len(body) > maxUserMessageBytes && strings.TrimSpace(system) != "" {
+		payload["system_prompt"] = shrinkToLimit(system, func(s string) ([]byte, error) {
+			payload["system_prompt"] = s
+			return wrap()
+		}, systemTrimMarker)
+		if body, err = wrap(); err != nil {
+			return err
 		}
 	}
-	return fmt.Errorf("%w: %d bytes after trimming prompt", ErrUserMessageTooLarge, len(body))
+
+	// 3. If metadata plus both fields still overflow, drop text to the marker.
+	if len(body) > maxUserMessageBytes && text != "" {
+		payload["text"] = shrinkToLimit(text, func(s string) ([]byte, error) {
+			payload["text"] = s
+			return wrap()
+		}, textTrimMarker)
+		if body, err = wrap(); err != nil {
+			return err
+		}
+	}
+
+	if len(body) > maxUserMessageBytes {
+		return fmt.Errorf("%w: %d bytes after trimming prompt and system prompt", ErrUserMessageTooLarge, len(body))
+	}
+	log.Printf("user_message trimmed %d -> %d bytes (limit %d)", original, len(body), maxUserMessageBytes)
+	return nil
+}
+
+const (
+	textTrimMarker   = "\n\n[earlier conversation trimmed to fit the upstream 64 KB frame limit]\n\n"
+	systemTrimMarker = "\n\n[caller system prompt trimmed to fit the upstream 64 KB frame limit]\n\n"
+)
+
+// shrinkToLimit removes bytes from the middle of s until wrap(s) fits. It
+// preserves the beginning and the end, so recent context and trailing
+// authority notices survive.
+func shrinkToLimit(s string, wrap func(string) ([]byte, error), marker string) string {
+	out := s
+	for range 6 {
+		body, err := wrap(out)
+		if err != nil || len(body) <= maxUserMessageBytes {
+			return out
+		}
+		over := len(body) - maxUserMessageBytes
+		next := shrinkMiddle(out, over, marker)
+		if next == out {
+			return out
+		}
+		out = next
+	}
+	return out
+}
+
+// shrinkMiddle removes about `remove` bytes from s while keeping 1/4 of the
+// retained text from the head and 3/4 from the tail. Slices are adjusted to
+// UTF-8 rune boundaries so the JSON stays valid.
+func shrinkMiddle(s string, remove int, marker string) string {
+	const minKeep = 4096
+	target := len(s) - remove - len(marker)
+	if target < minKeep {
+		target = minKeep
+	}
+	if target >= len(s) {
+		return s
+	}
+	head := target / 4
+	if head > len(s) {
+		head = len(s)
+	}
+	for head > 0 && !utf8.RuneStart(s[head]) {
+		head--
+	}
+	tailStart := len(s) - (target - head)
+	if tailStart < head {
+		tailStart = head
+	}
+	for tailStart < len(s) && !utf8.RuneStart(s[tailStart]) {
+		tailStart++
+	}
+	return s[:head] + marker + s[tailStart:]
 }
 
 func titleFor(prompt string) string {

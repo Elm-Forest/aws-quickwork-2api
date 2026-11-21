@@ -77,7 +77,9 @@ func newConversationStore(ttl time.Duration, max int) *conversationStore {
 }
 
 // acquire locks one conversation for the duration of a request. Expired and
-// least-recently-used conversations are dropped first.
+// least-recently-used conversations are dropped first. The store lock is
+// released before waiting on a conversation so one busy chat cannot stall
+// unrelated conversations.
 func (s *conversationStore) acquire(key string) *conversation {
 	s.mu.Lock()
 	for k, c := range s.entries {
@@ -103,9 +105,10 @@ func (s *conversationStore) acquire(key string) *conversation {
 		c = &conversation{}
 		s.entries[key] = c
 	}
+	s.mu.Unlock()
+
 	c.mu.Lock()
 	c.touch()
-	s.mu.Unlock()
 	return c
 }
 
@@ -115,18 +118,21 @@ func (s *conversationStore) release(c *conversation) {
 }
 
 // conversationKey identifies one OpenAI conversation. A client-provided
-// X-Thread-Id wins; otherwise the system prompt plus the first user message is
-// used so the key stays stable while the transcript grows.
-func conversationKey(r *http.Request, req *ChatRequest) string {
-	if id := strings.TrimSpace(r.Header.Get("X-Thread-Id")); id != "" {
-		return "h:" + id
+// X-Conversation-Id or X-Thread-Id wins; otherwise the full system prompt
+// (including tool definitions) plus the first user message is used so the key
+// stays stable while the transcript grows.
+func conversationKey(r *http.Request, req *ChatRequest, fullSystemPrompt string) string {
+	for _, header := range []string{"X-Conversation-Id", "X-Thread-Id"} {
+		if id := strings.TrimSpace(r.Header.Get(header)); id != "" {
+			return "h:" + id
+		}
 	}
 	h := sha256.New()
 	h.Write([]byte(r.Header.Get("Authorization")))
 	h.Write([]byte{0})
 	h.Write([]byte(r.Header.Get("X-Api-Key")))
 	h.Write([]byte{0})
-	h.Write([]byte(systemPrompt(req.Messages)))
+	h.Write([]byte(fullSystemPrompt))
 	for _, m := range req.Messages {
 		role := strings.ToLower(strings.TrimSpace(m.Role))
 		if role == "system" || role == "developer" {

@@ -44,7 +44,7 @@ func (s *Server) Handler() http.Handler {
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, X-Thread-Id")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, X-Thread-Id, X-Conversation-Id")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -118,15 +118,14 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	bridgePrompt := buildToolBridgePrompt(&req, choiceMode, choiceName, parallelTools)
 	bridgeActive := bridgePrompt != ""
-	baseSystemPrompt := systemPrompt(req.Messages)
 	systemPromptText := systemPrompt(req.Messages, bridgePrompt)
 
-	conv := s.sessions.acquire(conversationKey(r, &req))
+	conv := s.sessions.acquire(conversationKey(r, &req, systemPromptText))
 	defer s.sessions.release(conv)
 
 	resume := false
 	promptText := prompt
-	if s.cfg.SessionReuse && conv.systemPrompt == baseSystemPrompt {
+	if s.cfg.SessionReuse && conv.systemPrompt == systemPromptText {
 		if delta, ok := conv.delta(req.Messages); ok {
 			if deltaPrompt, err := formatPrompt(delta); err == nil && hasVisibleText(deltaPrompt) {
 				promptText = deltaPrompt
@@ -147,6 +146,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		ThreadID:      threadID,
 		Title:         titleFor(lastUserText(req.Messages)),
 		SystemPrompt:  systemPromptText,
+		ChatAgentID:   s.cfg.ChatAgentID,
 		CreateSession: true,
 		DeleteSession: !s.cfg.SessionReuse && !s.cfg.KeepSessions,
 	}
@@ -213,7 +213,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 				break
 			}
 			lastErr = err
-			s.accounts.ReportFailure(ctx, acct.ID, err)
+			if !errors.Is(err, ErrUserMessageTooLarge) && ctx.Err() == nil {
+				s.accounts.ReportFailure(ctx, acct.ID, err)
+			}
 			log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
 				id, attempt, maxAttempts, accountLogLabel(acct), err)
 			if errors.Is(err, ErrUserMessageTooLarge) {
@@ -250,7 +252,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			conv.threadID = res.ThreadID
 			conv.accountID = usedAccount.ID
 			conv.messages = append([]Message(nil), req.Messages...)
-			conv.systemPrompt = baseSystemPrompt
+			conv.systemPrompt = systemPromptText
 		}
 		text := res.Text
 		var replies []ToolCallReply
@@ -399,7 +401,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		lastErr = err
-		s.accounts.ReportFailure(ctx, acct.ID, err)
+		if !errors.Is(err, ErrUserMessageTooLarge) && ctx.Err() == nil {
+			s.accounts.ReportFailure(ctx, acct.ID, err)
+		}
 		log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
 			id, attempt, maxAttempts, accountLogLabel(acct), err)
 		if errors.Is(err, ErrUserMessageTooLarge) {
@@ -451,7 +455,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		conv.threadID = res.ThreadID
 		conv.accountID = usedAccount.ID
 		conv.messages = append([]Message(nil), req.Messages...)
-		conv.systemPrompt = baseSystemPrompt
+		conv.systemPrompt = systemPromptText
 	}
 	var outText string
 	var outTools []ToolCall
