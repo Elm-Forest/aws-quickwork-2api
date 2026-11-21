@@ -140,8 +140,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if requestedModel == "" {
 		requestedModel = "(default)"
 	}
-	log.Printf("chat %s start model=%s upstream_model=%s stream=%t messages=%d thread=%q",
-		id, requestedModel, model, req.Stream, len(req.Messages), threadID)
+	log.Printf("chat %s start model=%s upstream_model=%s stream=%t messages=%d prompt_chars=%d system_chars=%d thread=%q",
+		id, requestedModel, model, req.Stream, len(req.Messages), len(prompt), len(systemPromptText), threadID)
 
 	if !req.Stream {
 		var res ChatResult

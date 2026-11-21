@@ -420,6 +420,9 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			}
 		case "error", "session_error", "stream_error", "turn_failed":
 			res, _ := finish()
+			log.Printf("upstream %s error=%q code=%q payload=%s frame=%s",
+				env.Type, env.Error, env.ErrorCode,
+				truncateText(string(env.Payload), 1000), truncateText(jsonStr, 1500))
 			return res, fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, env.Error, env.ErrorCode))
 		default:
 			if terminal[env.Type] {
@@ -458,20 +461,56 @@ func deltaText(raw json.RawMessage) string {
 }
 
 func errorText(raw json.RawMessage, fallback, code string) string {
-	var p struct {
-		Message string `json:"message"`
-		Error   string `json:"error"`
-		Code    string `json:"code"`
-	}
 	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &p)
+		var v any
+		if json.Unmarshal(raw, &v) == nil {
+			if s := nestedErrorText(v); s != "" {
+				return s
+			}
+			if compact, err := json.Marshal(v); err == nil && len(compact) > 0 {
+				return truncateText(string(compact), 800)
+			}
+		}
+		if s := strings.TrimSpace(string(raw)); s != "" {
+			return truncateText(s, 800)
+		}
 	}
-	for _, s := range []string{p.Message, p.Error, fallback, p.Code, code} {
+	for _, s := range []string{fallback, code} {
 		if strings.TrimSpace(s) != "" {
 			return s
 		}
 	}
 	return "unknown upstream error"
+}
+
+func nestedErrorText(v any) string {
+	switch x := v.(type) {
+	case string:
+		return strings.TrimSpace(x)
+	case map[string]any:
+		for _, key := range []string{"message", "error", "detail", "reason", "description", "title"} {
+			if s, ok := x[key]; ok {
+				if text := nestedErrorText(s); text != "" {
+					return text
+				}
+			}
+		}
+	case []any:
+		for _, item := range x {
+			if text := nestedErrorText(item); text != "" {
+				return text
+			}
+		}
+	}
+	return ""
+}
+
+func truncateText(s string, max int) string {
+	s = strings.TrimSpace(s)
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	return s[:max] + "…"
 }
 
 func titleFor(prompt string) string {
