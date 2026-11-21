@@ -295,6 +295,7 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
 - 上游 `user_message` 帧上限 64 KB。代理发送前会计算 JSON 大小；超限时保留开头与结尾、裁剪中间历史，并记录 `user_message trimmed ...`。如果 `system_prompt` 加元数据已经超过上限，返回 `400 request_too_large`。
+- WebSocket 分片只影响传输层，上游重組後仍按單一 `user_message` 檢查 64 KB。多個 `user_message` 會被視為多輪；`mid_turn` 是 steering，`message_split` 是服務端輸出事件，不能用來拼接同一輪輸入。
 - 工具桥接使用文本协议，模型偶尔可能不遵守；有工具时流式响应会缓冲到本轮结束。代理只解析并返回 `tool_calls`，不执行工具。
 - `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，因此服务端默认提示词不会生效。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。

@@ -687,6 +687,11 @@ func truncateText(s string, max int) string {
 	return s[:max] + "…"
 }
 
+// fitUserMessage keeps the user_message payload under the upstream limit.
+// Upstream checks the reassembled user_message JSON, so WebSocket
+// fragmentation or multiple user_message frames cannot carry one oversized
+// turn: extra frames would become separate turns. Trim within the single frame
+// instead, keeping the beginning and the most recent tail.
 func fitUserMessage(payload map[string]any) error {
 	wrap := func() ([]byte, error) {
 		return json.Marshal(map[string]any{"type": "user_message", "payload": payload})
