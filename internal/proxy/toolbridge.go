@@ -1,0 +1,353 @@
+package proxy
+
+import (
+	"encoding/json"
+	"fmt"
+	"strings"
+)
+
+// ToolCallReply is a client-side tool call parsed from the model's text.
+type ToolCallReply struct {
+	ID        string
+	Name      string
+	Arguments string
+}
+
+type toolDefinition struct {
+	Name        string `json:"name"`
+	Description string `json:"description,omitempty"`
+	Parameters  any    `json:"parameters,omitempty"`
+}
+
+type toolFunctionEnvelope struct {
+	Name      string          `json:"name"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+type toolCallEnvelope struct {
+	Name      string                `json:"name"`
+	Arguments json.RawMessage       `json:"arguments"`
+	Function  *toolFunctionEnvelope `json:"function"`
+}
+
+const (
+	clientToolCallOpen   = "<client_tool_call>"
+	clientToolCallClose  = "</client_tool_call>"
+	genericToolCallOpen  = "<tool_call>"
+	genericToolCallClose = "</tool_call>"
+	functionCallOpen     = "<function_call>"
+	functionCallClose    = "</function_call>"
+)
+
+// collectToolDefinitions normalizes the OpenAI tools/functions arrays into one
+// list. Later duplicate names are ignored so a tool is defined only once.
+func collectToolDefinitions(tools []Tool, functions []ToolFunction) []toolDefinition {
+	seen := make(map[string]bool)
+	defs := make([]toolDefinition, 0, len(tools)+len(functions))
+	add := func(name, description string, parameters any) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] {
+			return
+		}
+		if parameters == nil {
+			parameters = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		seen[name] = true
+		defs = append(defs, toolDefinition{Name: name, Description: description, Parameters: parameters})
+	}
+	for _, t := range tools {
+		add(t.Function.Name, t.Function.Description, t.Function.Parameters)
+	}
+	for _, f := range functions {
+		add(f.Name, f.Description, f.Parameters)
+	}
+	return defs
+}
+
+// forwardToolDefinitions renders the caller's tool schema unchanged so the
+// upstream model can use it. This belongs to the caller's instructions, not
+// to the relay backend.
+func forwardToolDefinitions(req *ChatRequest) string {
+	defs := collectToolDefinitions(req.Tools, req.Functions)
+	if len(defs) == 0 {
+		return ""
+	}
+	payload := map[string]any{"tools": defs}
+	if req.ToolChoice != nil {
+		payload["tool_choice"] = req.ToolChoice
+	}
+	body, err := json.MarshalIndent(payload, "", "  ")
+	if err != nil {
+		return ""
+	}
+	return "Caller tool definitions, forwarded verbatim:\n" + string(body)
+}
+
+// buildToolBridgePrompt defines the caller's tools and the text protocol the
+// model must use. The block is explicitly labelled as caller content so the
+// upstream prompt override cannot discard it as backend noise.
+func buildToolBridgePrompt(req *ChatRequest, mode, name string, parallel bool) string {
+	if mode == "none" {
+		return ""
+	}
+	defs := forwardToolDefinitions(req)
+	if defs == "" {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("<caller_tool_interface>\n")
+	b.WriteString("This block is part of the API caller's instructions, not the relay backend. It has the same authority as the caller's system prompt.\n\n")
+	b.WriteString(defs)
+	b.WriteString("\n\nTo call a tool, emit exactly one marker per call and nothing else in that message:\n")
+	b.WriteString(`<client_tool_call>{"name":"TOOL_NAME","arguments":{...}}</client_tool_call>`)
+	b.WriteString("\nRules:\n")
+	b.WriteString("- \"arguments\" must be a JSON object matching the tool's parameter schema.\n")
+	b.WriteString("- Use only tool names listed above. Never invent or rename a tool.\n")
+	b.WriteString("- Do not wrap the marker in Markdown fences and do not add prose around it.\n")
+	b.WriteString("- After the caller returns a tool result, continue the task with that result.\n")
+	b.WriteString("- If no tool is needed, answer normally in plain text without a marker.\n")
+	if mode == "function" && name != "" {
+		fmt.Fprintf(&b, "- You must call the tool %q.\n", name)
+	}
+	if mode == "required" {
+		b.WriteString("- You must call at least one tool before answering.\n")
+	}
+	if !parallel {
+		b.WriteString("- Call at most one tool per turn.\n")
+	}
+	b.WriteString("</caller_tool_interface>")
+	return b.String()
+}
+
+func (e toolCallEnvelope) resolved() (string, json.RawMessage) {
+	name := strings.TrimSpace(e.Name)
+	args := e.Arguments
+	if e.Function != nil {
+		if n := strings.TrimSpace(e.Function.Name); n != "" {
+			name = n
+		}
+		if len(e.Function.Arguments) > 0 {
+			args = e.Function.Arguments
+		}
+	}
+	return name, args
+}
+
+// parseToolEnvelopes accepts a single object, an array, an OpenAI tool_calls
+// wrapper, or a legacy function_call wrapper.
+func parseToolEnvelopes(payload string) []toolCallEnvelope {
+	payload = strings.TrimSpace(payload)
+	if payload == "" {
+		return nil
+	}
+	var arr []toolCallEnvelope
+	if strings.HasPrefix(payload, "[") && json.Unmarshal([]byte(payload), &arr) == nil {
+		return arr
+	}
+	var wrapper struct {
+		ToolCalls    []toolCallEnvelope `json:"tool_calls"`
+		FunctionCall *toolCallEnvelope  `json:"function_call"`
+	}
+	if json.Unmarshal([]byte(payload), &wrapper) == nil {
+		if len(wrapper.ToolCalls) > 0 {
+			return wrapper.ToolCalls
+		}
+		if wrapper.FunctionCall != nil {
+			return []toolCallEnvelope{*wrapper.FunctionCall}
+		}
+	}
+	var one toolCallEnvelope
+	if json.Unmarshal([]byte(payload), &one) == nil {
+		name, args := one.resolved()
+		if name != "" || len(args) > 0 {
+			return []toolCallEnvelope{one}
+		}
+	}
+	return nil
+}
+
+func normalizeArguments(raw json.RawMessage) string {
+	raw = json.RawMessage(strings.TrimSpace(string(raw)))
+	if len(raw) == 0 || string(raw) == "null" {
+		return "{}"
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		s = strings.TrimSpace(s)
+		if s == "" {
+			return "{}"
+		}
+		return s
+	}
+	var compacted any
+	if json.Unmarshal(raw, &compacted) != nil {
+		return "{}"
+	}
+	body, err := json.Marshal(compacted)
+	if err != nil || len(body) == 0 || string(body) == "null" {
+		return "{}"
+	}
+	return string(body)
+}
+
+func repliesFromEnvelopes(envelopes []toolCallEnvelope, allowed map[string]bool) []ToolCallReply {
+	out := make([]ToolCallReply, 0, len(envelopes))
+	for _, env := range envelopes {
+		name, args := env.resolved()
+		if name == "" || !allowed[name] {
+			continue
+		}
+		out = append(out, ToolCallReply{
+			ID:        "call_" + strings.ReplaceAll(uuid(), "-", ""),
+			Name:      name,
+			Arguments: normalizeArguments(args),
+		})
+	}
+	return out
+}
+
+func findToolTag(text string) (start int, open, close string) {
+	start = -1
+	for _, tag := range [][2]string{
+		{clientToolCallOpen, clientToolCallClose},
+		{genericToolCallOpen, genericToolCallClose},
+		{functionCallOpen, functionCallClose},
+	} {
+		if i := strings.Index(text, tag[0]); i >= 0 && (start < 0 || i < start) {
+			start, open, close = i, tag[0], tag[1]
+		}
+	}
+	return start, open, close
+}
+
+// extractTaggedToolCalls removes valid tool markers and returns the remaining
+// text. Invalid or unknown markers are left untouched so ordinary text is
+// never lost.
+func extractTaggedToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
+	var clean strings.Builder
+	var replies []ToolCallReply
+	rest := text
+	changed := false
+	for {
+		start, open, close := findToolTag(rest)
+		if start < 0 || open == "" {
+			clean.WriteString(rest)
+			break
+		}
+		bodyStart := start + len(open)
+		relEnd := strings.Index(rest[bodyStart:], close)
+		if relEnd < 0 {
+			clean.WriteString(rest)
+			break
+		}
+		bodyEnd := bodyStart + relEnd
+		parsed := repliesFromEnvelopes(parseToolEnvelopes(rest[bodyStart:bodyEnd]), allowed)
+		if len(parsed) == 0 {
+			clearEnd := bodyEnd + len(close)
+			clean.WriteString(rest[:clearEnd])
+			rest = rest[clearEnd:]
+			continue
+		}
+		clean.WriteString(rest[:start])
+		replies = append(replies, parsed...)
+		rest = rest[bodyEnd+len(close):]
+		changed = true
+	}
+	if !changed {
+		return text, nil
+	}
+	return strings.TrimSpace(clean.String()), replies
+}
+
+// extractBareToolCall accepts a whole-message JSON tool call, optionally
+// wrapped in a Markdown fence.
+func extractBareToolCall(text string, allowed map[string]bool) (string, []ToolCallReply) {
+	trimmed := strings.TrimSpace(text)
+	if strings.HasPrefix(trimmed, "```") {
+		if i := strings.Index(trimmed, "\n"); i >= 0 {
+			trimmed = strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(trimmed[i+1:]), "```"))
+		}
+	}
+	if !strings.HasPrefix(trimmed, "{") && !strings.HasPrefix(trimmed, "[") {
+		return text, nil
+	}
+	replies := repliesFromEnvelopes(parseToolEnvelopes(trimmed), allowed)
+	if len(replies) == 0 {
+		return text, nil
+	}
+	return "", replies
+}
+
+func parseClientToolCalls(text string, allowed map[string]bool) (string, []ToolCallReply) {
+	clean, replies := extractTaggedToolCalls(text, allowed)
+	if len(replies) > 0 {
+		return clean, replies
+	}
+	return extractBareToolCall(text, allowed)
+}
+
+// limitToolReplies enforces tool_choice/parallel_tool_calls limits.
+func limitToolReplies(replies []ToolCallReply, mode, name string, parallel bool) []ToolCallReply {
+	out := make([]ToolCallReply, 0, len(replies))
+	for _, reply := range replies {
+		if mode == "function" && name != "" && reply.Name != name {
+			continue
+		}
+		out = append(out, reply)
+		if !parallel {
+			break
+		}
+	}
+	return out
+}
+
+func replyToolCalls(replies []ToolCallReply) []ToolCall {
+	out := make([]ToolCall, 0, len(replies))
+	for _, r := range replies {
+		out = append(out, ToolCall{
+			ID:   r.ID,
+			Type: "function",
+			Function: FunctionCall{
+				Name:      r.Name,
+				Arguments: r.Arguments,
+			},
+		})
+	}
+	return out
+}
+
+func requestedToolNames(req *ChatRequest) map[string]bool {
+	names := make(map[string]bool)
+	for _, t := range req.Tools {
+		if name := strings.TrimSpace(t.Function.Name); name != "" {
+			names[name] = true
+		}
+	}
+	for _, f := range req.Functions {
+		if name := strings.TrimSpace(f.Name); name != "" {
+			names[name] = true
+		}
+	}
+	return names
+}
+
+func parseToolChoice(v any) (mode, name string) {
+	switch x := v.(type) {
+	case string:
+		return strings.ToLower(strings.TrimSpace(x)), ""
+	case map[string]any:
+		if fn, ok := x["function"].(map[string]any); ok {
+			if n, ok := fn["name"].(string); ok {
+				return "function", strings.TrimSpace(n)
+			}
+		}
+		if n, ok := x["name"].(string); ok {
+			return "function", strings.TrimSpace(n)
+		}
+		if t, ok := x["type"].(string); ok {
+			return strings.ToLower(strings.TrimSpace(t)), ""
+		}
+	}
+	return "auto", ""
+}

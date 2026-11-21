@@ -104,8 +104,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	systemPromptText := systemPrompt(req.Messages, forwardToolDefinitions(&req))
 	model := s.mapModel(req.Model)
+	allowedTools := requestedToolNames(&req)
+	choiceMode, choiceName := parseToolChoice(req.ToolChoice)
+	if choiceMode == "function" && choiceName != "" {
+		allowedTools[choiceName] = true
+	}
+	parallelTools := true
+	if req.ParallelToolCalls != nil {
+		parallelTools = *req.ParallelToolCalls
+	}
+	bridgePrompt := buildToolBridgePrompt(&req, choiceMode, choiceName, parallelTools)
+	bridgeActive := bridgePrompt != ""
+	systemPromptText := systemPrompt(req.Messages, bridgePrompt)
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout.Duration())
 	defer cancel()
@@ -172,19 +183,37 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			}
-			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, lastErr)
+			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
 		text := res.Text
-		if strings.TrimSpace(text) == "" {
-			errEmpty := errors.New("upstream returned no text")
-			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, errEmpty)
+		var replies []ToolCallReply
+		if bridgeActive {
+			text, replies = parseClientToolCalls(text, allowedTools)
+			replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
+		}
+		toolCalls := replyToolCalls(replies)
+		if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
+			errEmpty := errors.New("upstream returned no text or tool calls")
+			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", errEmpty.Error())
 			return
 		}
-		message := map[string]any{"role": "assistant", "content": text}
-		logChatDone(id, startedAt, in, usedAccount, attempts, "ok", "stop", res.Usage, nil)
+		message := map[string]any{"role": "assistant"}
+		if strings.TrimSpace(text) == "" {
+			message["content"] = nil
+		} else {
+			message["content"] = text
+		}
+		if len(toolCalls) > 0 {
+			message["tool_calls"] = toolCalls
+		}
+		finish := "stop"
+		if len(toolCalls) > 0 {
+			finish = "tool_calls"
+		}
+		logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), nil)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":      id,
 			"object":  "chat.completion",
@@ -193,7 +222,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"choices": []map[string]any{{
 				"index":         0,
 				"message":       message,
-				"finish_reason": "stop",
+				"finish_reason": finish,
 			}},
 			"usage": usageMap(res.Usage),
 		})
@@ -262,6 +291,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sawText := false
+	var bridgeBuffer strings.Builder
 
 	var res ChatResult
 	var lastErr error
@@ -285,6 +315,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
 		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
 			if ev.Type == "text" && ev.Text != "" {
+				if bridgeActive {
+					bridgeBuffer.WriteString(ev.Text)
+					return nil
+				}
 				sawText = true
 				writeChunk(map[string]any{"content": ev.Text}, nil)
 			}
@@ -307,6 +341,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		// Nothing reached the client yet; reset per-attempt state and try
 		// the next account in rotation.
 		sawText = false
+		bridgeBuffer.Reset()
 	}
 	if lastErr != nil {
 		if !started {
@@ -314,26 +349,57 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			}
-			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, lastErr)
+			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
-		logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, lastErr)
+		logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 		writeStreamError(lastErr.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
-	if !sawText {
+	var outText string
+	var outTools []ToolCall
+	finish := "stop"
+	if bridgeActive {
+		outText, replies := parseClientToolCalls(bridgeBuffer.String(), allowedTools)
+		replies = limitToolReplies(replies, choiceMode, choiceName, parallelTools)
+		outTools = replyToolCalls(replies)
+		if len(outTools) > 0 {
+			finish = "tool_calls"
+		} else if strings.TrimSpace(outText) == "" {
+			errEmpty := errors.New("upstream returned no text or tool calls")
+			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
+			writeStreamError(errEmpty.Error())
+			_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
+			flusher.Flush()
+			return
+		}
+	} else if !sawText {
 		errEmpty := errors.New("upstream returned no text")
-		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, errEmpty)
+		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, 0, errEmpty)
 		writeStreamError(errEmpty.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
-	writeChunk(map[string]any{}, "stop")
-	logChatDone(id, startedAt, in, usedAccount, attempts, "ok", "stop", res.Usage, nil)
+	if strings.TrimSpace(outText) != "" {
+		writeChunk(map[string]any{"content": outText}, nil)
+	}
+	for i, tc := range outTools {
+		writeChunk(map[string]any{"tool_calls": []map[string]any{{
+			"index": i,
+			"id":    tc.ID,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      tc.Function.Name,
+				"arguments": tc.Function.Arguments,
+			},
+		}}}, nil)
+	}
+	writeChunk(map[string]any{}, finish)
+	logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(outTools), nil)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		writePayload(map[string]any{
 			"id":      id,
@@ -366,13 +432,13 @@ func accountLogLabel(a *store.Account) string {
 
 // logChatDone emits one completion line per chat request with the outcome,
 // selected account, mapped model, token usage, finish reason, and error.
-func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Account, attempts int, status, finish string, u Usage, err error) {
+func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Account, attempts int, status, finish string, u Usage, toolCalls int, err error) {
 	if finish == "" {
 		finish = "-"
 	}
-	line := fmt.Sprintf("chat %s done status=%s account=%s model=%s attempts=%d elapsed=%s tokens{prompt=%d completion=%d total=%d cache_read=%d cache_write=%d} finish=%s",
+	line := fmt.Sprintf("chat %s done status=%s account=%s model=%s attempts=%d elapsed=%s tokens{prompt=%d completion=%d total=%d cache_read=%d cache_write=%d} finish=%s tool_calls=%d",
 		id, status, accountLogLabel(acct), in.Model, attempts, time.Since(startedAt).Round(time.Millisecond),
-		u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CacheReadTokens, u.CacheWriteTokens, finish)
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CacheReadTokens, u.CacheWriteTokens, finish, toolCalls)
 	if err != nil {
 		log.Printf("%s error=%v", line, err)
 		return

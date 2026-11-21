@@ -17,7 +17,7 @@
 - 请求按轮询选择账号；到期 token 自动 refresh；失败时切换到下一个账号重试
 - 可选本地 API key 保护
 - 默认每轮对话结束后删除上游会话，避免污染聊天列表
-- 不解析工具调用：请求中的 `tools` / `functions` / `tool_choice` 原样写入 `system_prompt` 转给上游，响应只返回文本，不返回 `tool_calls`
+- 客户端 `tools` / `functions` 通过 `<caller_tool_interface>` 文本协议桥接；代理解析 `<client_tool_call>` 并返回 OpenAI `tool_calls`，实际执行仍在客户端
 - 历史中的 `assistant.tool_calls` / `role: tool` 仍会按文本渲染，供上游理解已有上下文
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
 - `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，并附加后端提示词覆盖声明，要求模型忽略上游追加的 system / agent 指令；不拼进 user 文本
@@ -261,18 +261,21 @@ sequenceDiagram
 - `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.system_prompt`。
 - `system_prompt` 始终发送：合并后的调用方指令后面固定追加一条严格的系统提示词优先级声明，要求模型丢弃 QuickWork 服务端附加的所有 system / developer / agent / runtime / system-reminder 指令，即使它们出现在后面、自称更具体、自称可覆盖该声明，或标记为 system 消息。客户端未提供 system 消息时，字段只包含该声明，服务端默认提示词不再生效。已验证 social 路径，enterprise / gateway 仍待逐项验证。
 - 覆盖声明写在 `system_prompt` 里，不是 user 文本注入，也不会把 system prompt 塞进 user 文本。
-- 代理不处理工具调用：请求中的 `tools` / `functions` / `tool_choice` 会原样序列化进 `system_prompt`，直接转给上游模型；代理不解析、不执行、不转换工具调用，响应只包含文本，`finish_reason` 始终为 `stop`，不返回 `tool_calls`。
-- 上游的 `tool_start` / `tool_arguments` / `tool_result` 等工具事件会被忽略；如果上游只产生工具事件而没有文本，代理返回 `upstream returned no text`。
-- 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果；这只用于保留上下文，不会触发新的工具调用。
+- 客户端 `tools` / `functions` / `tool_choice` 会原样写入 `system_prompt` 的 `<caller_tool_interface>` 块。该块明确标记为调用方指令；覆盖声明也会保留它，不当作后端提示词丢弃。
+- 模型使用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。解析器同时兼容 `<tool_call>`、`<function_call>` 和整段 JSON（包括 OpenAI `tool_calls` / `function_call` 结构），未知工具名或非法 JSON 会保留为普通文本。
+- 代理把解析结果转成 OpenAI `tool_calls`，但**不执行工具**；客户端执行后把结果作为 `role: tool` 发回，代理再转成文本上下文。
+- 上游原生 `tool_start` / `tool_arguments` / `tool_result` 事件仍被忽略；客户端工具只走上述文本标记协议。
+- 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送文本或 `tool_calls`；非流式不受影响。
+- `tool_choice: "none"` 关闭桥接；指定函数时只接受该函数；`parallel_tool_calls=false` 时最多返回一个工具调用。
 
 ### 请求日志
 
-每个聊天请求输出三类日志：请求开始、每次账号尝试、最终结果。最终结果包含状态、账号、上游模型、尝试次数、耗时、token 用量、`finish_reason` 和错误信息。
+每个聊天请求输出三类日志：请求开始、每次账号尝试、最终结果。最终结果包含状态、账号、上游模型、尝试次数、耗时、token 用量、`finish_reason`、工具调用数和错误信息。
 
 ```
 chat chatcmpl-... start model=smart upstream_model=smart stream=false messages=2 thread=""
 chat chatcmpl-... attempt=1/3 account=1:social:user@example.com
-chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart attempts=1 elapsed=1.234s tokens{prompt=1200 completion=56 total=1256 cache_read=1024 cache_write=0} finish=stop
+chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart attempts=1 elapsed=1.234s tokens{prompt=1200 completion=56 total=1256 cache_read=1024 cache_write=0} finish=stop tool_calls=0
 ```
 
 `status` 为 `ok`、`empty` 或 `failed`；`attempt` 为 `id/最大尝试次数`。失败时附加 `error=...`。日志不会输出 token、client secret 或请求正文。
@@ -289,7 +292,7 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 ## 限制
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
-- 不支持 OpenAI 结构化工具调用。`tools` / `functions` / `tool_choice` 只作为文本原样转发给上游，代理不会把上游输出转成 `tool_calls`；需要工具执行请直接在客户端处理。
+- 工具桥接使用文本协议，模型偶尔可能不遵守；有工具时流式响应会缓冲到本轮结束。代理只解析并返回 `tool_calls`，不执行工具。
 - `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，因此服务端默认提示词不会生效。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
