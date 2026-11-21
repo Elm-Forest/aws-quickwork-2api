@@ -51,10 +51,12 @@ type loginFlow struct {
 	verifier    string
 	challenge   string
 
-	discovery discovery
-	clientID  string
-	secret    string
-	oidcBase  string
+	discovery     discovery
+	clientID      string
+	secret        string
+	oidcBase      string
+	discoveryDone bool
+	authorizeURL  string
 
 	done chan struct{}
 	once sync.Once
@@ -229,13 +231,20 @@ func runManualLogin(ctx context.Context, opts LoginOptions, f *loginFlow, in io.
 			continue
 		}
 		if q.Get("nonce") != "" {
+			repeated := f.discoveryDone
 			authURL, err := f.processDiscovery(waitCtx, q)
 			if err != nil {
 				fmt.Fprintf(out, "discovery failed: %v\n", err)
 				continue
 			}
-			fmt.Fprintf(out, "Open this URL to continue signing in:\n%s\n", authURL)
-			fmt.Fprintln(out, "After the browser redirects, paste the next callback URL.")
+			if repeated {
+				fmt.Fprintln(out, "This is the discovery callback again; discovery is already complete.")
+				fmt.Fprintln(out, "Open the authorize URL below, finish signing in, then paste the callback containing code=...&state=...:")
+			} else {
+				fmt.Fprintln(out, "Open this URL to continue signing in:")
+			}
+			fmt.Fprintln(out, authURL)
+			fmt.Fprintf(out, "Next, paste the callback URL containing code=...&state=... (redirect_uri=%s).\n", f.redirectURI)
 			continue
 		}
 		if q.Get("code") == "" && q.Get("error") == "" {
@@ -370,6 +379,9 @@ func (f *loginFlow) processDiscovery(ctx context.Context, q url.Values) (string,
 	if v := q.Get("error"); v != "" {
 		return "", stepErrorf(http.StatusBadRequest, "login failed: %s %s", v, q.Get("error_description"))
 	}
+	if f.discoveryDone {
+		return f.authorizeURL, nil
+	}
 
 	if isEnterpriseDiscovery(f.provider) {
 		f.discovery = discovery{
@@ -399,7 +411,9 @@ func (f *loginFlow) processDiscovery(ctx context.Context, q url.Values) (string,
 			"access_type":           {"offline"},
 			"prompt":                {"consent"},
 		}
-		return appendQuery(f.discovery.AuthEndpoint, params), nil
+		f.authorizeURL = appendQuery(f.discovery.AuthEndpoint, params)
+		f.discoveryDone = true
+		return f.authorizeURL, nil
 	}
 
 	f.discovery = discovery{
@@ -440,7 +454,9 @@ func (f *loginFlow) processDiscovery(ctx context.Context, q url.Values) (string,
 		"code_challenge":        {f.challenge},
 		"code_challenge_method": {"S256"},
 	}
-	return appendQuery(f.oidcEndpoint(idcRegion)+"/authorize", params), nil
+	f.authorizeURL = appendQuery(f.oidcEndpoint(idcRegion)+"/authorize", params)
+	f.discoveryDone = true
+	return f.authorizeURL, nil
 }
 
 type clientCredentials struct {

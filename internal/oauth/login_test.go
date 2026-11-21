@@ -375,12 +375,15 @@ func TestManualLoginFlow(t *testing.T) {
 	})
 	var out bytes.Buffer
 	acct, err := runManualLogin(context.Background(), opts, f,
-		strings.NewReader(discoveryCallback+"\n"+codeCallback+"\n"), &out)
+		strings.NewReader(discoveryCallback+"\n"+discoveryCallback+"\n"+codeCallback+"\n"), &out)
 	if err != nil {
 		t.Fatalf("manual login: %v\noutput:\n%s", err, out.String())
 	}
 	if !strings.Contains(out.String(), "Open this URL to continue signing in:") {
 		t.Fatalf("missing authorize prompt:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "discovery is already complete") {
+		t.Fatalf("missing repeated-discovery hint:\n%s", out.String())
 	}
 	if !strings.Contains(out.String(), "Login complete: manual@example.com") {
 		t.Fatalf("missing completion message:\n%s", out.String())
@@ -391,5 +394,53 @@ func TestManualLoginFlow(t *testing.T) {
 	}
 	if saved.Email != "manual@example.com" || saved.AccessToken != "manual-access" {
 		t.Fatalf("unexpected saved account: %+v", saved)
+	}
+}
+
+func TestDiscoveryRepeatedDoesNotRegisterAgain(t *testing.T) {
+	st := testStore(t)
+	registers := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/client/register" {
+			http.NotFound(w, r)
+			return
+		}
+		registers++
+		writeJSON(t, w, map[string]any{"clientId": "client-id", "clientSecret": "client-secret"})
+	}))
+	defer srv.Close()
+
+	f := &loginFlow{
+		opts:        LoginOptions{Logf: t.Logf},
+		store:       st,
+		provider:    "social",
+		stage:       "prod",
+		region:      "us-east-1",
+		redirectURI: "http://127.0.0.1:18080",
+		state:       "state",
+		nonce:       "nonce",
+		verifier:    "verifier",
+		challenge:   "challenge",
+		oidcBase:    srv.URL,
+	}
+	q := url.Values{
+		"nonce":     {"nonce"},
+		"issuerUrl": {"https://idc.example/ssoins-test"},
+		"tenantUrl": {"https://tenant.example"},
+		"idcRegion": {"us-east-1"},
+	}
+	first, err := f.processDiscovery(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := f.processDiscovery(context.Background(), q)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("authorize URL changed:\nfirst:  %s\nsecond: %s", first, second)
+	}
+	if registers != 1 {
+		t.Fatalf("client registered %d times, want 1", registers)
 	}
 }
