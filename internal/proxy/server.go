@@ -117,11 +117,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	bridgePrompt := buildToolBridgePrompt(req.Tools, req.Functions, choiceMode, choiceName, parallelTools)
 	bridgeActive := bridgePrompt != ""
 	if bridgeActive {
-		if strings.TrimSpace(systemPromptText) != "" {
-			systemPromptText += "\n\n" + bridgePrompt
-		} else {
-			systemPromptText = bridgePrompt
-		}
+		systemPromptText += "\n\n" + bridgePrompt
 	}
 	bridgeAllowed := allowedTools
 	if choiceMode == "function" && choiceName != "" {

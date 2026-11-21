@@ -208,9 +208,9 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		"panel_edits":        []any{},
 		"custom_prompt":      nil,
 	}
-	// system_prompt is the native per-turn override. When the client supplies
-	// system/developer messages, it replaces QuickWork's base prompt; when it
-	// is absent, the service default remains. No injection text is added.
+	// system_prompt is the native per-turn override. It always carries the
+	// caller's system/developer instructions plus the backend-prompt override
+	// notice, so instructions the service attaches to the turn lose precedence.
 	if strings.TrimSpace(in.SystemPrompt) != "" {
 		payload["system_prompt"] = in.SystemPrompt
 	}

@@ -21,7 +21,7 @@
 - 客户端 `tools` / `functions` 通过 `<client_tool_call>` 协议桥接；代理返回 OpenAI `tool_calls`，实际执行仍在客户端
 - 上游原生 `tool_start` / `tool_arguments` / `tool_result` 在名称匹配时也会转成 OpenAI `tool_calls`
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
-- `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，不拼进 user 文本，也不做提示词注入
+- `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，并附加后端提示词覆盖声明，要求模型忽略上游追加的 system / agent 指令；不拼进 user 文本
 
 ## 环境要求
 
@@ -260,8 +260,8 @@ sequenceDiagram
 ### 提示词与工具调用
 
 - `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.system_prompt`。
-- 非空 `system_prompt` 会覆盖 QuickWork 服务端基础 system prompt；未提供时保留服务端默认。已验证 social 路径，enterprise / gateway 仍待逐项验证。
-- 不会添加“ignore previous instructions”等额外指令，也不会把 system prompt 塞进 user 文本。
+- `system_prompt` 始终发送：合并后的调用方指令后面固定追加一条后端提示词覆盖声明，要求模型忽略 QuickWork 服务端附加的 system / developer / agent 指令（身份、人格、产品名、默认行为、工具偏好、回复风格等），只遵循调用方指令和对话消息。客户端未提供 system 消息时，字段只包含该声明，服务端默认提示词不再生效。已验证 social 路径，enterprise / gateway 仍待逐项验证。
+- 覆盖声明写在 `system_prompt` 里，不是 user 文本注入，也不会把 system prompt 塞进 user 文本。
 - 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果，供上游继续推理。
 - 客户端在 `tools` / `functions` 中声明的工具会以 `<client_tool_protocol>` 追加到 system prompt；模型用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。
 - 如果客户端 system prompt 要求“必须用原生工具调用”或“禁止把工具调用写成文本”，桥接会附加一条后端能力说明：原生函数调用不可用，仅对列出的客户端工具改用该标记，其他指令保持不变。这是工具协议适配，不是通用提示词注入。
@@ -283,7 +283,7 @@ sequenceDiagram
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
 - 工具执行在客户端；代理只负责把模型输出转成 `tool_calls`。桥接使用文本协议，模型偶尔可能不遵守；带工具的流式响应会缓冲到本轮结束。
-- `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息会保留服务端默认提示词。
+- `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，因此服务端默认提示词不会生效。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
 - social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。
