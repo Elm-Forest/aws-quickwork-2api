@@ -114,9 +114,9 @@ func runServer(args []string) int {
 
 	log.Printf("quickwork-openai listening on %s (config=%s db=%s accounts=%d auth=%v)",
 		cfg.Addr, cfg.Path, cfg.Database, count, len(cfg.APIKeys) > 0)
-	log.Printf("models=%s default_model=%s request_timeout=%s refresh_before=%s max_attempts=%d keep_sessions=%v",
+	log.Printf("models=%s default_model=%s request_timeout=%s refresh_before=%s max_attempts=%d keep_sessions=%v session_reuse=%v session_ttl=%s",
 		strings.Join(cfg.Models, ","), cfg.DefaultModel, cfg.RequestTimeout.Duration(),
-		cfg.RefreshBefore.Duration(), cfg.MaxAttempts, cfg.KeepSessions)
+		cfg.RefreshBefore.Duration(), cfg.MaxAttempts, cfg.KeepSessions, cfg.SessionReuse, cfg.SessionTTL.Duration())
 	if count == 0 {
 		log.Printf("no accounts stored; run `quickproxy login` to add one")
 	}

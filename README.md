@@ -16,7 +16,8 @@
 - 账号存放在 SQLite（`data/quickwork.db`），支持多账号轮询与自动刷新
 - 请求按轮询选择账号；到期 token 自动 refresh；失败时切换到下一个账号重试
 - 可选本地 API key 保护
-- 默认每轮对话结束后删除上游会话，避免污染聊天列表
+- 默认复用上游会话（`session_reuse=true`）；设为 `false` 时每轮结束删除会话，避免污染聊天列表
+- 会话复用：同一段对话固定上游 thread 与账号，每轮只送新增消息，避免重送整份 transcript 撞 64 KB 上限
 - 客户端 `tools` / `functions` 通过 `<caller_tool_interface>` 文本协议桥接；代理解析 `<client_tool_call>` 并返回 OpenAI `tool_calls`，实际执行仍在客户端
 - 历史中的 `assistant.tool_calls` / `role: tool` 仍会按文本渲染，供上游理解已有上下文
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
@@ -144,6 +145,8 @@ for chunk in client.chat.completions.create(
   "locale": "en-US",
   "thinking_effort": "",
   "keep_sessions": false,
+  "session_reuse": true,
+  "session_ttl": "30m",
   "oauth": {
     "provider": "social",
     "build_stage": "prod",
@@ -169,7 +172,9 @@ for chunk in client.chat.completions.create(
 | `outpost_id` / `working_session_id` | 空 | 上游握手可选字段 |
 | `timezone` / `locale` | `UTC` / `en-US` | `user_message` 中的时区与语言 |
 | `thinking_effort` | 空 | `off`、`low`、`medium`、`high`；空=服务端默认，`off` 会显式发送关闭 |
-| `keep_sessions` | `false` | 保留上游会话，不在一轮结束后删除 |
+| `keep_sessions` | `false` | 关闭 `session_reuse` 时，是否保留上游会话 |
+| `session_reuse` | `true` | 以固定上游会话只送新增消息；同一会话固定使用原账号 |
+| `session_ttl` | `30m` | 会话闲置多久后从代理内存移除 |
 | `oauth.provider` | `social` | `login` 默认 provider |
 | `oauth.build_stage` | `prod` | `prod`、`beta`、`integ`、`dev` |
 | `oauth.region` | 空 | 企业 discovery 的 region 前缀；social 使用 discovery 返回的 IDC region |
@@ -269,6 +274,15 @@ sequenceDiagram
 - 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送文本或 `tool_calls`；非流式不受影响。
 - `tool_choice: "none"` 关闭桥接；指定函数时只接受该函数；`parallel_tool_calls=false` 时最多返回一个工具调用。
 
+### 会话复用
+
+- 首轮发送完整 transcript，并记录上游 `thread_id` 与账号。
+- 后续请求若消息历史是上次已发送历史的前缀，只发送新增后缀；这样 64 KB 预算主要留给新消息。
+- system prompt 变化、历史被编辑、或没有新增消息时，自动回退为完整 transcript + 新上游会话。
+- 同一会话固定使用原账号；账号不可用或复用失败时，自动换账号并以完整 transcript 新建会话。
+- 会话状态只保存在内存，进程重启后首轮回退完整 transcript。闲置超过 `session_ttl` 会从代理移除。
+- 复用启用时不会发送 `session_delete`，上游会话会保留到服务端自身过期。
+
 ### 请求日志
 
 每个聊天请求输出请求开始、每次账号尝试、最终结果，以及一行上游事件统计。最终结果包含状态、账号、上游模型、尝试次数、耗时、token 用量、`finish_reason`、工具调用数和错误信息。
@@ -294,7 +308,7 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 ## 限制
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
-- 上游 `user_message` 帧上限 64 KB。代理发送前会计算 JSON 大小；超限时保留开头与结尾、裁剪中间历史，并记录 `user_message trimmed ...`。如果 `system_prompt` 加元数据已经超过上限，返回 `400 request_too_large`。
+- 上游 `user_message` 帧上限 64 KB。会话复用开启时通常只送新增消息；若单个 delta 仍超限，代理会在发送前保留开头与结尾、裁剪中间历史，并记录 `user_message trimmed ...`。如果 `system_prompt` 加元数据已经超过上限，返回 `400 request_too_large`。
 - WebSocket 分片只影响传输层，上游重組後仍按單一 `user_message` 檢查 64 KB。多個 `user_message` 會被視為多輪；`mid_turn` 是 steering，`message_split` 是服務端輸出事件，不能用來拼接同一輪輸入。
 - 工具桥接使用文本协议，模型偶尔可能不遵守；有工具时流式响应会缓冲到本轮结束。代理只解析并返回 `tool_calls`，不执行工具。
 - `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，因此服务端默认提示词不会生效。

@@ -76,6 +76,27 @@ func (m *Manager) Next(ctx context.Context) (*store.Account, error) {
 	return nil, fmt.Errorf("no usable account: %s", strings.Join(errs, "; "))
 }
 
+// NextPinned returns one specific account, refreshing it when needed. It is
+// used to keep a conversation on the account that owns its upstream session.
+func (m *Manager) NextPinned(ctx context.Context, id int64) (*store.Account, error) {
+	a, err := m.store.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if a.Disabled {
+		return nil, fmt.Errorf("account %d is disabled", id)
+	}
+	usable, err := m.ensureFresh(ctx, a)
+	if err != nil {
+		_ = m.store.SetError(ctx, a.ID, err.Error())
+		return nil, err
+	}
+	if err := m.store.MarkUsed(ctx, usable.ID); err != nil {
+		return nil, err
+	}
+	return usable, nil
+}
+
 func (m *Manager) ensureFresh(ctx context.Context, a *store.Account) (*store.Account, error) {
 	if !a.Expiring(time.Now(), m.cfg.RefreshBefore.Duration()) {
 		if a.JWT() == "" {

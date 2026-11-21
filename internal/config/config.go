@@ -67,6 +67,8 @@ type Config struct {
 	Locale           string   `json:"locale"`
 	ThinkingEffort   string   `json:"thinking_effort"`
 	KeepSessions     bool     `json:"keep_sessions"`
+	SessionReuse     bool     `json:"session_reuse"`
+	SessionTTL       Duration `json:"session_ttl"`
 	OAuth            OAuth    `json:"oauth"`
 
 	// Path is the absolute config file path; not serialized.
@@ -88,6 +90,10 @@ func Default() Config {
 		Surface:        "QUICK_WORK_DESKTOP_WINDOWS",
 		Timezone:       "UTC",
 		Locale:         "en-US",
+		ThinkingEffort: "",
+		KeepSessions:   false,
+		SessionReuse:   true,
+		SessionTTL:     Duration(30 * time.Minute),
 		OAuth: OAuth{
 			Provider:     "social",
 			BuildStage:   "prod",
@@ -164,6 +170,9 @@ func applyDefaults(c *Config) {
 	}
 	if c.RefreshBefore < 0 {
 		c.RefreshBefore = d.RefreshBefore
+	}
+	if c.SessionTTL <= 0 {
+		c.SessionTTL = d.SessionTTL
 	}
 	if c.MaxAttempts <= 0 {
 		c.MaxAttempts = d.MaxAttempts

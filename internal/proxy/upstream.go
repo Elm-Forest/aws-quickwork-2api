@@ -37,11 +37,13 @@ func NewUpstream(cfg *config.Config) *Upstream {
 
 // ChatInput is one upstream turn.
 type ChatInput struct {
-	Prompt       string
-	Model        string
-	ThreadID     string
-	Title        string
-	SystemPrompt string
+	Prompt        string
+	Model         string
+	ThreadID      string
+	Title         string
+	SystemPrompt  string
+	CreateSession bool
+	DeleteSession bool
 }
 
 // ToolCallState is a native tool invocation reported by the QuickWork agent.
@@ -81,6 +83,7 @@ type ChatResult struct {
 	Text      string
 	ToolCalls []ToolCallState
 	Usage     Usage
+	ThreadID  string
 }
 
 // Chat sends one prompt through the QuickWork chat bidi WebSocket. Text
@@ -186,10 +189,12 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		})
 	}
 	_ = send(map[string]any{"type": "federate_status", "payload": map[string]any{}})
-	_ = send(map[string]any{
-		"type":    "session_create",
-		"payload": map[string]any{"session_id": threadID, "title": title},
-	})
+	if in.CreateSession {
+		_ = send(map[string]any{
+			"type":    "session_create",
+			"payload": map[string]any{"session_id": threadID, "title": title},
+		})
+	}
 
 	payload := map[string]any{
 		"text":               in.Prompt,
@@ -229,12 +234,12 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	}
 
 	result, err := u.readEvents(ctx, conn, gateway, threadID, onEvent)
+	result.ThreadID = threadID
+	if in.DeleteSession {
+		_ = send(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
+	}
 	if err != nil {
 		return result, err
-	}
-
-	if !u.cfg.KeepSessions {
-		_ = send(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
 	}
 	return result, nil
 }

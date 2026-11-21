@@ -20,6 +20,7 @@ type Server struct {
 	accounts *accounts.Manager
 	tokens   *APIKeyAuth
 	upstream *Upstream
+	sessions *conversationStore
 }
 
 func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
@@ -28,6 +29,7 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 		accounts: mgr,
 		tokens:   NewAPIKeyAuth(cfg.APIKeys),
 		upstream: NewUpstream(cfg),
+		sessions: newConversationStore(cfg.SessionTTL.Duration(), 256),
 	}
 }
 
@@ -116,7 +118,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	bridgePrompt := buildToolBridgePrompt(&req, choiceMode, choiceName, parallelTools)
 	bridgeActive := bridgePrompt != ""
+	baseSystemPrompt := systemPrompt(req.Messages)
 	systemPromptText := systemPrompt(req.Messages, bridgePrompt)
+
+	conv := s.sessions.acquire(conversationKey(r, &req))
+	defer s.sessions.release(conv)
+
+	resume := false
+	promptText := prompt
+	if s.cfg.SessionReuse && conv.systemPrompt == baseSystemPrompt {
+		if delta, ok := conv.delta(req.Messages); ok {
+			if deltaPrompt, err := formatPrompt(delta); err == nil && hasVisibleText(deltaPrompt) {
+				promptText = deltaPrompt
+				resume = true
+			}
+		}
+	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout.Duration())
 	defer cancel()
@@ -125,30 +142,56 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	id := "chatcmpl-" + strings.ReplaceAll(uuid(), "-", "")
 	created := time.Now().Unix()
 	in := ChatInput{
-		Prompt:       prompt,
-		Model:        model,
-		ThreadID:     threadID,
-		Title:        titleFor(lastUserText(req.Messages)),
-		SystemPrompt: systemPromptText,
+		Prompt:        promptText,
+		Model:         model,
+		ThreadID:      threadID,
+		Title:         titleFor(lastUserText(req.Messages)),
+		SystemPrompt:  systemPromptText,
+		CreateSession: true,
+		DeleteSession: !s.cfg.SessionReuse && !s.cfg.KeepSessions,
+	}
+	if resume {
+		in.ThreadID = conv.threadID
+		in.CreateSession = false
 	}
 
 	startedAt := time.Now()
 	maxAttempts := s.maxAttempts(ctx)
+	if resume {
+		maxAttempts++
+	}
 	attempts := 0
 	var usedAccount *store.Account
 	requestedModel := strings.TrimSpace(req.Model)
 	if requestedModel == "" {
 		requestedModel = "(default)"
 	}
-	log.Printf("chat %s start model=%s upstream_model=%s stream=%t messages=%d prompt_chars=%d system_chars=%d thread=%q",
-		id, requestedModel, model, req.Stream, len(req.Messages), len(prompt), len(systemPromptText), threadID)
+	log.Printf("chat %s start model=%s upstream_model=%s stream=%t messages=%d prompt_chars=%d system_chars=%d reuse=%t thread=%q",
+		id, requestedModel, model, req.Stream, len(req.Messages), len(promptText), len(systemPromptText), resume, in.ThreadID)
+
+	selectAccount := func(attempt int) (*store.Account, error) {
+		if resume && attempt == 1 && conv.accountID != 0 {
+			acct, err := s.accounts.NextPinned(ctx, conv.accountID)
+			if err == nil {
+				return acct, nil
+			}
+			log.Printf("chat %s pinned account %d unavailable: %v; starting a new session",
+				id, conv.accountID, err)
+			conv.reset()
+			resume = false
+			in.ThreadID = ""
+			in.CreateSession = true
+			in.Prompt = prompt
+		}
+		return s.accounts.Next(ctx)
+	}
 
 	if !req.Stream {
 		var res ChatResult
 		var lastErr error
 		for attempt := 1; attempt <= maxAttempts; attempt++ {
 			attempts = attempt
-			acct, err := s.accounts.Next(ctx)
+			acct, err := selectAccount(attempt)
 			if err != nil {
 				lastErr = err
 				log.Printf("chat %s attempt=%d/%d account=none error=%v", id, attempt, maxAttempts, err)
@@ -176,12 +219,22 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(err, ErrUserMessageTooLarge) {
 				break
 			}
+			if resume {
+				conv.reset()
+				resume = false
+				in.ThreadID = ""
+				in.CreateSession = true
+				in.Prompt = prompt
+				log.Printf("chat %s session resume failed; retrying with full transcript", id)
+				continue
+			}
 			if ctx.Err() != nil {
 				log.Printf("chat %s request context ended: %v", id, ctx.Err())
 				break
 			}
 		}
 		if lastErr != nil {
+			conv.reset()
 			status, code := http.StatusBadGateway, "upstream_error"
 			switch {
 			case errors.Is(lastErr, accounts.ErrNoAccounts):
@@ -192,6 +245,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
+		}
+		if s.cfg.SessionReuse && res.ThreadID != "" {
+			conv.threadID = res.ThreadID
+			conv.accountID = usedAccount.ID
+			conv.messages = append([]Message(nil), req.Messages...)
+			conv.systemPrompt = baseSystemPrompt
 		}
 		text := res.Text
 		var replies []ToolCallReply
@@ -306,7 +365,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		attempts = attempt
-		acct, err := s.accounts.Next(ctx)
+		acct, err := selectAccount(attempt)
 		if err != nil {
 			lastErr = err
 			log.Printf("chat %s attempt=%d/%d account=none error=%v", id, attempt, maxAttempts, err)
@@ -346,6 +405,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if errors.Is(err, ErrUserMessageTooLarge) {
 			break
 		}
+		if resume && !started {
+			conv.reset()
+			resume = false
+			in.ThreadID = ""
+			in.CreateSession = true
+			in.Prompt = prompt
+			sawVisibleText = false
+			bridgeBuffer.Reset()
+			log.Printf("chat %s session resume failed; retrying with full transcript", id)
+			continue
+		}
 		if started || ctx.Err() != nil {
 			if started {
 				log.Printf("chat %s stream already started; not retrying", id)
@@ -358,6 +428,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		bridgeBuffer.Reset()
 	}
 	if lastErr != nil {
+		conv.reset()
 		if !started {
 			status, code := http.StatusBadGateway, "upstream_error"
 			switch {
@@ -375,6 +446,12 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
+	}
+	if s.cfg.SessionReuse && res.ThreadID != "" {
+		conv.threadID = res.ThreadID
+		conv.accountID = usedAccount.ID
+		conv.messages = append([]Message(nil), req.Messages...)
+		conv.systemPrompt = baseSystemPrompt
 	}
 	var outText string
 	var outTools []ToolCall

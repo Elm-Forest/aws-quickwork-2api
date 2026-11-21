@@ -20,6 +20,8 @@
   "locale": "en-US",
   "thinking_effort": "",
   "keep_sessions": false,
+  "session_reuse": true,
+  "session_ttl": "30m",
   "oauth": {
     "provider": "social",
     "build_stage": "prod",
