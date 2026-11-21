@@ -12,6 +12,7 @@ import (
 
 	"quickwork-openai/internal/accounts"
 	"quickwork-openai/internal/config"
+	"quickwork-openai/internal/store"
 )
 
 type Server struct {
@@ -103,26 +104,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	systemPromptText := systemPrompt(req.Messages)
+	systemPromptText := systemPrompt(req.Messages, forwardToolDefinitions(&req))
 	model := s.mapModel(req.Model)
-	allowedTools := requestedToolNames(&req)
-	choiceMode, choiceName := parseToolChoice(req.ToolChoice)
-	if choiceMode == "function" && choiceName != "" {
-		allowedTools[choiceName] = true
-	}
-	parallelTools := true
-	if req.ParallelToolCalls != nil {
-		parallelTools = *req.ParallelToolCalls
-	}
-	bridgePrompt := buildToolBridgePrompt(req.Tools, req.Functions, choiceMode, choiceName, parallelTools)
-	bridgeActive := bridgePrompt != ""
-	if bridgeActive {
-		systemPromptText += "\n\n" + bridgePrompt
-	}
-	bridgeAllowed := allowedTools
-	if choiceMode == "function" && choiceName != "" {
-		bridgeAllowed = map[string]bool{choiceName: true}
-	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout.Duration())
 	defer cancel()
@@ -138,21 +121,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		SystemPrompt: systemPromptText,
 	}
 
+	startedAt := time.Now()
+	maxAttempts := s.maxAttempts(ctx)
+	attempts := 0
+	var usedAccount *store.Account
+	requestedModel := strings.TrimSpace(req.Model)
+	if requestedModel == "" {
+		requestedModel = "(default)"
+	}
+	log.Printf("chat %s start model=%s upstream_model=%s stream=%t messages=%d thread=%q",
+		id, requestedModel, model, req.Stream, len(req.Messages), threadID)
+
 	if !req.Stream {
 		var res ChatResult
 		var lastErr error
-		for range s.maxAttempts(ctx) {
+		for attempt := 1; attempt <= maxAttempts; attempt++ {
+			attempts = attempt
 			acct, err := s.accounts.Next(ctx)
 			if err != nil {
 				lastErr = err
+				log.Printf("chat %s attempt=%d/%d account=none error=%v", id, attempt, maxAttempts, err)
 				break
 			}
+			usedAccount = acct
 			sess := SessionFromAccount(acct, s.cfg)
 			if err := sess.validate(); err != nil {
 				s.accounts.ReportFailure(ctx, acct.ID, err)
 				lastErr = err
+				log.Printf("chat %s attempt=%d/%d account=%s invalid_session error=%v",
+					id, attempt, maxAttempts, accountLogLabel(acct), err)
 				continue
 			}
+			log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
 			res, err = s.upstream.Chat(ctx, sess, in, nil)
 			if err == nil {
 				lastErr = nil
@@ -160,7 +160,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			}
 			lastErr = err
 			s.accounts.ReportFailure(ctx, acct.ID, err)
+			log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
+				id, attempt, maxAttempts, accountLogLabel(acct), err)
 			if ctx.Err() != nil {
+				log.Printf("chat %s request context ended: %v", id, ctx.Err())
 				break
 			}
 		}
@@ -169,38 +172,19 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			}
+			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
 		text := res.Text
-		var bridgeReplies []ToolCallReply
-		if bridgeActive {
-			text, bridgeReplies = parseClientToolCalls(text, bridgeAllowed)
-			if !parallelTools && len(bridgeReplies) > 1 {
-				bridgeReplies = bridgeReplies[:1]
-			}
-		}
-		toolCalls := replyToolCalls(bridgeReplies)
-		if len(toolCalls) == 0 {
-			toolCalls = filterToolCalls(res.ToolCalls, allowedTools, choiceMode, choiceName, parallelTools)
-		}
-		if strings.TrimSpace(text) == "" && len(toolCalls) == 0 {
-			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", "upstream returned no text or tool calls")
+		if strings.TrimSpace(text) == "" {
+			errEmpty := errors.New("upstream returned no text")
+			logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, errEmpty)
+			writeOpenAIError(w, http.StatusBadGateway, "upstream_error", errEmpty.Error())
 			return
 		}
-		message := map[string]any{"role": "assistant"}
-		if strings.TrimSpace(text) == "" {
-			message["content"] = nil
-		} else {
-			message["content"] = text
-		}
-		if len(toolCalls) > 0 {
-			message["tool_calls"] = toolCalls
-		}
-		finish := "stop"
-		if len(bridgeReplies) > 0 || (strings.TrimSpace(text) == "" && len(toolCalls) > 0) {
-			finish = "tool_calls"
-		}
+		message := map[string]any{"role": "assistant", "content": text}
+		logChatDone(id, startedAt, in, usedAccount, attempts, "ok", "stop", res.Usage, nil)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":      id,
 			"object":  "chat.completion",
@@ -209,7 +193,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			"choices": []map[string]any{{
 				"index":         0,
 				"message":       message,
-				"finish_reason": finish,
+				"finish_reason": "stop",
 			}},
 			"usage": usageMap(res.Usage),
 		})
@@ -278,96 +262,31 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	sawText := false
-	sawTool := false
-	var bridgeBuffer strings.Builder
-	toolIndex := 0
-	toolIndexes := make(map[string]int)
-	sentArgs := make(map[string]string)
-	emitTool := func(tc ToolCallState) {
-		if !toolAllowed(tc, allowedTools, choiceMode, choiceName) {
-			return
-		}
-		idx, seen := toolIndexes[tc.ID]
-		if !seen {
-			if !parallelTools && sawTool {
-				return
-			}
-			idx = toolIndex
-			toolIndex++
-			toolIndexes[tc.ID] = idx
-			args := strings.TrimSpace(tc.Arguments)
-			if args == "" {
-				args = "{}"
-			}
-			sentArgs[tc.ID] = args
-			writeChunk(map[string]any{"tool_calls": []map[string]any{{
-				"index": idx,
-				"id":    tc.ID,
-				"type":  "function",
-				"function": map[string]any{
-					"name":      tc.Name,
-					"arguments": args,
-				},
-			}}}, nil)
-			sawTool = true
-			return
-		}
-		args := strings.TrimSpace(tc.Arguments)
-		if args == "" {
-			args = "{}"
-		}
-		prev := sentArgs[tc.ID]
-		if args == prev {
-			return
-		}
-		delta := args
-		if strings.HasPrefix(args, prev) {
-			delta = args[len(prev):]
-		}
-		sentArgs[tc.ID] = args
-		if delta == "" {
-			return
-		}
-		writeChunk(map[string]any{"tool_calls": []map[string]any{{
-			"index":    idx,
-			"function": map[string]any{"arguments": delta},
-		}}}, nil)
-		sawTool = true
-	}
 
 	var res ChatResult
 	var lastErr error
-	for range s.maxAttempts(ctx) {
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		attempts = attempt
 		acct, err := s.accounts.Next(ctx)
 		if err != nil {
 			lastErr = err
+			log.Printf("chat %s attempt=%d/%d account=none error=%v", id, attempt, maxAttempts, err)
 			break
 		}
+		usedAccount = acct
 		sess := SessionFromAccount(acct, s.cfg)
 		if err := sess.validate(); err != nil {
 			s.accounts.ReportFailure(ctx, acct.ID, err)
 			lastErr = err
+			log.Printf("chat %s attempt=%d/%d account=%s invalid_session error=%v",
+				id, attempt, maxAttempts, accountLogLabel(acct), err)
 			continue
 		}
+		log.Printf("chat %s attempt=%d/%d account=%s", id, attempt, maxAttempts, accountLogLabel(acct))
 		res, err = s.upstream.Chat(ctx, sess, in, func(ev StreamEvent) error {
-			switch ev.Type {
-			case "text":
-				if ev.Text == "" {
-					return nil
-				}
-				if bridgeActive {
-					bridgeBuffer.WriteString(ev.Text)
-					return nil
-				}
+			if ev.Type == "text" && ev.Text != "" {
 				sawText = true
 				writeChunk(map[string]any{"content": ev.Text}, nil)
-			case "tool_call", "tool_call_update":
-				if bridgeActive {
-					return nil
-				}
-				if ev.ToolCall != nil {
-					emitTool(*ev.ToolCall)
-				}
 			}
 			return nil
 		})
@@ -377,17 +296,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		lastErr = err
 		s.accounts.ReportFailure(ctx, acct.ID, err)
+		log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
+			id, attempt, maxAttempts, accountLogLabel(acct), err)
 		if started || ctx.Err() != nil {
+			if started {
+				log.Printf("chat %s stream already started; not retrying", id)
+			}
 			break
 		}
 		// Nothing reached the client yet; reset per-attempt state and try
 		// the next account in rotation.
 		sawText = false
-		sawTool = false
-		bridgeBuffer.Reset()
-		toolIndex = 0
-		toolIndexes = make(map[string]int)
-		sentArgs = make(map[string]string)
 	}
 	if lastErr != nil {
 		if !started {
@@ -395,70 +314,26 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			if errors.Is(lastErr, accounts.ErrNoAccounts) {
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
 			}
+			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
 			return
 		}
+		logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, lastErr)
 		writeStreamError(lastErr.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
-	if bridgeActive {
-		text, replies := parseClientToolCalls(bridgeBuffer.String(), bridgeAllowed)
-		if !parallelTools && len(replies) > 1 {
-			replies = replies[:1]
-		}
-		if len(replies) > 0 {
-			if strings.TrimSpace(text) != "" {
-				writeChunk(map[string]any{"content": text}, nil)
-			}
-			for i, reply := range replies {
-				writeChunk(map[string]any{"tool_calls": []map[string]any{{
-					"index": i,
-					"id":    reply.ID,
-					"type":  "function",
-					"function": map[string]any{
-						"name":      reply.Name,
-						"arguments": reply.Arguments,
-					},
-				}}}, nil)
-			}
-			writeChunk(map[string]any{}, "tool_calls")
-		} else {
-			if strings.TrimSpace(text) == "" {
-				writeStreamError("upstream returned no text or tool calls")
-				_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-				flusher.Flush()
-				return
-			}
-			writeChunk(map[string]any{"content": text}, nil)
-			writeChunk(map[string]any{}, "stop")
-		}
-		if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
-			writePayload(map[string]any{
-				"id":      id,
-				"object":  "chat.completion.chunk",
-				"created": created,
-				"model":   model,
-				"choices": []any{},
-				"usage":   usageMap(res.Usage),
-			})
-		}
+	if !sawText {
+		errEmpty := errors.New("upstream returned no text")
+		logChatDone(id, startedAt, in, usedAccount, attempts, "empty", "", res.Usage, errEmpty)
+		writeStreamError(errEmpty.Error())
 		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 		flusher.Flush()
 		return
 	}
-	if !sawText && !sawTool {
-		writeStreamError("upstream returned no text or tool calls")
-		_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
-		flusher.Flush()
-		return
-	}
-	finish := "stop"
-	if !sawText && sawTool {
-		finish = "tool_calls"
-	}
-	writeChunk(map[string]any{}, finish)
+	writeChunk(map[string]any{}, "stop")
+	logChatDone(id, startedAt, in, usedAccount, attempts, "ok", "stop", res.Usage, nil)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		writePayload(map[string]any{
 			"id":      id,
@@ -471,6 +346,38 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
 	flusher.Flush()
+}
+
+// accountLogLabel identifies an account in request logs without exposing
+// tokens. Format: id:provider:email.
+func accountLogLabel(a *store.Account) string {
+	if a == nil {
+		return "none"
+	}
+	name := strings.TrimSpace(a.Email)
+	if name == "" {
+		name = strings.TrimSpace(a.DisplayName)
+	}
+	if name == "" {
+		name = "-"
+	}
+	return fmt.Sprintf("%d:%s:%s", a.ID, a.Provider, name)
+}
+
+// logChatDone emits one completion line per chat request with the outcome,
+// selected account, mapped model, token usage, finish reason, and error.
+func logChatDone(id string, startedAt time.Time, in ChatInput, acct *store.Account, attempts int, status, finish string, u Usage, err error) {
+	if finish == "" {
+		finish = "-"
+	}
+	line := fmt.Sprintf("chat %s done status=%s account=%s model=%s attempts=%d elapsed=%s tokens{prompt=%d completion=%d total=%d cache_read=%d cache_write=%d} finish=%s",
+		id, status, accountLogLabel(acct), in.Model, attempts, time.Since(startedAt).Round(time.Millisecond),
+		u.PromptTokens, u.CompletionTokens, u.TotalTokens, u.CacheReadTokens, u.CacheWriteTokens, finish)
+	if err != nil {
+		log.Printf("%s error=%v", line, err)
+		return
+	}
+	log.Print(line)
 }
 
 func (s *Server) maxAttempts(ctx context.Context) int {
@@ -501,87 +408,6 @@ func (s *Server) mapModel(model string) string {
 		log.Printf("unknown model %q, using %s", model, s.cfg.DefaultModel)
 		return s.cfg.DefaultModel
 	}
-}
-
-func requestedToolNames(req *ChatRequest) map[string]bool {
-	names := make(map[string]bool)
-	for _, t := range req.Tools {
-		if name := strings.TrimSpace(t.Function.Name); name != "" {
-			names[name] = true
-		}
-	}
-	for _, f := range req.Functions {
-		if name := strings.TrimSpace(f.Name); name != "" {
-			names[name] = true
-		}
-	}
-	return names
-}
-
-func parseToolChoice(v any) (mode, name string) {
-	switch x := v.(type) {
-	case string:
-		return strings.ToLower(strings.TrimSpace(x)), ""
-	case map[string]any:
-		if fn, ok := x["function"].(map[string]any); ok {
-			if n, ok := fn["name"].(string); ok {
-				return "function", strings.TrimSpace(n)
-			}
-		}
-		if n, ok := x["name"].(string); ok {
-			return "function", strings.TrimSpace(n)
-		}
-		if t, ok := x["type"].(string); ok {
-			return strings.ToLower(strings.TrimSpace(t)), ""
-		}
-	}
-	return "auto", ""
-}
-
-func toolAllowed(tc ToolCallState, allowed map[string]bool, mode, name string) bool {
-	if mode == "none" || len(allowed) == 0 {
-		return false
-	}
-	if !allowed[tc.Name] {
-		return false
-	}
-	if mode == "function" && name != "" && tc.Name != name {
-		return false
-	}
-	return true
-}
-
-func filterToolCalls(calls []ToolCallState, allowed map[string]bool, mode, name string, parallel bool) []ToolCall {
-	out := make([]ToolCall, 0, len(calls))
-	for _, tc := range calls {
-		if !toolAllowed(tc, allowed, mode, name) {
-			continue
-		}
-		if !parallel && len(out) > 0 {
-			break
-		}
-		id := strings.TrimSpace(tc.ID)
-		if id == "" {
-			id = "call_" + strings.ReplaceAll(uuid(), "-", "")
-		}
-		toolName := strings.TrimSpace(tc.Name)
-		if toolName == "" {
-			toolName = "unknown"
-		}
-		args := strings.TrimSpace(tc.Arguments)
-		if args == "" {
-			args = "{}"
-		}
-		out = append(out, ToolCall{
-			ID:   id,
-			Type: "function",
-			Function: FunctionCall{
-				Name:      toolName,
-				Arguments: args,
-			},
-		})
-	}
-	return out
 }
 
 func usageMap(u Usage) map[string]any {

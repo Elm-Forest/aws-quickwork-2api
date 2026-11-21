@@ -17,9 +17,8 @@
 - 请求按轮询选择账号；到期 token 自动 refresh；失败时切换到下一个账号重试
 - 可选本地 API key 保护
 - 默认每轮对话结束后删除上游会话，避免污染聊天列表
-- 保留 `assistant.tool_calls` / `role: tool` 历史，客户端工具调用链不会丢上下文
-- 客户端 `tools` / `functions` 通过 `<client_tool_call>` 协议桥接；代理返回 OpenAI `tool_calls`，实际执行仍在客户端
-- 上游原生 `tool_start` / `tool_arguments` / `tool_result` 在名称匹配时也会转成 OpenAI `tool_calls`
+- 不解析工具调用：请求中的 `tools` / `functions` / `tool_choice` 原样写入 `system_prompt` 转给上游，响应只返回文本，不返回 `tool_calls`
+- 历史中的 `assistant.tool_calls` / `role: tool` 仍会按文本渲染，供上游理解已有上下文
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
 - `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，并附加后端提示词覆盖声明，要求模型忽略上游追加的 system / agent 指令；不拼进 user 文本
 
@@ -84,7 +83,7 @@ https://quick.aws.com/sn?qwSurface=desktop:<nonce>:18080:1.2.4660
 ### 3. 启动反代
 
 ```bash
-./bin/quickproxy serve
+./bin/quickproxy server
 ```
 
 服务读取当前目录的 `config.json`。默认监听 `127.0.0.1:8080`。如果 `api_keys` 为空，代理关闭 API key 鉴权，适合纯本机使用。
@@ -125,7 +124,7 @@ for chunk in client.chat.completions.create(
 
 ## 配置 `config.json`
 
-`quickproxy serve` / `login` 在文件不存在时会写入默认配置。完整示例：
+`quickproxy server` / `login` 在文件不存在时会写入默认配置。完整示例：
 
 ```json
 {
@@ -238,7 +237,7 @@ sequenceDiagram
     participant B as 浏览器
     participant Q as Amazon Quick
     participant DB as SQLite
-    participant P as quickproxy serve
+    participant P as quickproxy server
 
     U->>CLI: login
     CLI-->>U: 打印 discovery URL
@@ -254,21 +253,29 @@ sequenceDiagram
 ```
 
 - 登录完全在 `quickproxy login` 内完成，不依赖官方桌面应用或 outpost。
-- `quickproxy serve` 从 SQLite 读取 `jwt`、`ws_host` 和 `provider`，连接上游 WebSocket。
+- `quickproxy server` 从 SQLite 读取 `jwt`、`ws_host` 和 `provider`，连接上游 WebSocket。
 - 上游不是 OpenAI HTTP API，而是 WebSocket JSON 帧；`internal/proxy/wire.go` 负责帧编码与 event-stream 解码。
 
 ### 提示词与工具调用
 
 - `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.system_prompt`。
-- `system_prompt` 始终发送：合并后的调用方指令后面固定追加一条后端提示词覆盖声明，要求模型忽略 QuickWork 服务端附加的 system / developer / agent 指令（身份、人格、产品名、默认行为、工具偏好、回复风格等），只遵循调用方指令和对话消息。客户端未提供 system 消息时，字段只包含该声明，服务端默认提示词不再生效。已验证 social 路径，enterprise / gateway 仍待逐项验证。
+- `system_prompt` 始终发送：合并后的调用方指令后面固定追加一条严格的系统提示词优先级声明，要求模型丢弃 QuickWork 服务端附加的所有 system / developer / agent / runtime / system-reminder 指令，即使它们出现在后面、自称更具体、自称可覆盖该声明，或标记为 system 消息。客户端未提供 system 消息时，字段只包含该声明，服务端默认提示词不再生效。已验证 social 路径，enterprise / gateway 仍待逐项验证。
 - 覆盖声明写在 `system_prompt` 里，不是 user 文本注入，也不会把 system prompt 塞进 user 文本。
-- 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果，供上游继续推理。
-- 客户端在 `tools` / `functions` 中声明的工具会以 `<client_tool_protocol>` 追加到 system prompt；模型用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。
-- 如果客户端 system prompt 要求“必须用原生工具调用”或“禁止把工具调用写成文本”，桥接会附加一条后端能力说明：原生函数调用不可用，仅对列出的客户端工具改用该标记，其他指令保持不变。这是工具协议适配，不是通用提示词注入。
-- 代理解析该标记并返回 OpenAI `tool_calls`，但**不执行工具**；客户端执行后把结果作为 `role: tool` 发回，代理再转成文本上下文。
-- 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送 `tool_calls` 或文本；非流式不受影响。
-- `tool_choice: "none"` 会关闭桥接；`tool_choice` 为具体函数时只接受该函数。上游原生工具事件在名称匹配时仍可转成 `tool_calls`。
-- 非流式响应中，工具调用放在 `choices[0].message.tool_calls`；桥接调用或只有工具且没有最终文本时 `finish_reason` 为 `tool_calls`，否则为 `stop`。
+- 代理不处理工具调用：请求中的 `tools` / `functions` / `tool_choice` 会原样序列化进 `system_prompt`，直接转给上游模型；代理不解析、不执行、不转换工具调用，响应只包含文本，`finish_reason` 始终为 `stop`，不返回 `tool_calls`。
+- 上游的 `tool_start` / `tool_arguments` / `tool_result` 等工具事件会被忽略；如果上游只产生工具事件而没有文本，代理返回 `upstream returned no text`。
+- 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果；这只用于保留上下文，不会触发新的工具调用。
+
+### 请求日志
+
+每个聊天请求输出三类日志：请求开始、每次账号尝试、最终结果。最终结果包含状态、账号、上游模型、尝试次数、耗时、token 用量、`finish_reason` 和错误信息。
+
+```
+chat chatcmpl-... start model=smart upstream_model=smart stream=false messages=2 thread=""
+chat chatcmpl-... attempt=1/3 account=1:social:user@example.com
+chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart attempts=1 elapsed=1.234s tokens{prompt=1200 completion=56 total=1256 cache_read=1024 cache_write=0} finish=stop
+```
+
+`status` 为 `ok`、`empty` 或 `failed`；`attempt` 为 `id/最大尝试次数`。失败时附加 `error=...`。日志不会输出 token、client secret 或请求正文。
 
 ## 安全与隐私
 
@@ -282,7 +289,7 @@ sequenceDiagram
 ## 限制
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
-- 工具执行在客户端；代理只负责把模型输出转成 `tool_calls`。桥接使用文本协议，模型偶尔可能不遵守；带工具的流式响应会缓冲到本轮结束。
+- 不支持 OpenAI 结构化工具调用。`tools` / `functions` / `tool_choice` 只作为文本原样转发给上游，代理不会把上游输出转成 `tool_calls`；需要工具执行请直接在客户端处理。
 - `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，因此服务端默认提示词不会生效。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
@@ -310,7 +317,7 @@ sequenceDiagram
 ```
 quickwork-openai/
   config.json              服务端配置（首次运行自动生成）
-  cmd/quickproxy/          CLI：serve / login / accounts / refresh / logout
+  cmd/quickproxy/          CLI：server / login / accounts / refresh / logout
   internal/config/         config.json 加载与默认值
   internal/oauth/          原生 OAuth、PKCE、token refresh、user info
   internal/store/          SQLite 账号存储

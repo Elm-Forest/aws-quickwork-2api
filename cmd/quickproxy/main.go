@@ -27,11 +27,11 @@ func main() {
 
 func run(args []string) int {
 	if len(args) == 0 {
-		return serve(nil)
+		return runServer(nil)
 	}
 	switch args[0] {
-	case "serve":
-		return serve(args[1:])
+	case "server":
+		return runServer(args[1:])
 	case "login":
 		return login(args[1:])
 	case "accounts", "list":
@@ -45,7 +45,7 @@ func run(args []string) int {
 		return 0
 	default:
 		if strings.HasPrefix(args[0], "-") {
-			return serve(args)
+			return runServer(args)
 		}
 		fmt.Fprintf(os.Stderr, "unknown command %q\n\n", args[0])
 		usage()
@@ -57,7 +57,7 @@ func usage() {
 	fmt.Fprint(os.Stderr, `quickwork-openai - Amazon Quick to OpenAI-compatible API
 
 Usage:
-  quickproxy serve    [-config config.json]
+  quickproxy server   [-config config.json]
   quickproxy login    [-config config.json] [-provider social|enterprise|gateway|social_gateway]
                       [-stage prod|beta|integ|dev] [-region REGION] [-port 18080]
                       [-timeout 1h] [-open] [-manual]
@@ -65,7 +65,7 @@ Usage:
   quickproxy refresh  [-config config.json] [-account ID]
   quickproxy logout   [-config config.json] (-all | -account ID)
 
-Running without a subcommand is equivalent to "serve".
+Running without a subcommand is equivalent to "server".
 
 config.json is created with defaults on first use. Accounts are stored in the
 SQLite database named by "database" in config.json. When multiple accounts are
@@ -85,8 +85,8 @@ func openStore(cfg *config.Config) (*store.Store, error) {
 	return st, nil
 }
 
-func serve(args []string) int {
-	fs := flag.NewFlagSet("serve", flag.ExitOnError)
+func runServer(args []string) int {
+	fs := flag.NewFlagSet("server", flag.ExitOnError)
 	configPath := fs.String("config", "config.json", "path to config.json")
 	_ = fs.Parse(args)
 
@@ -114,6 +114,9 @@ func serve(args []string) int {
 
 	log.Printf("quickwork-openai listening on %s (config=%s db=%s accounts=%d auth=%v)",
 		cfg.Addr, cfg.Path, cfg.Database, count, len(cfg.APIKeys) > 0)
+	log.Printf("models=%s default_model=%s request_timeout=%s refresh_before=%s max_attempts=%d keep_sessions=%v",
+		strings.Join(cfg.Models, ","), cfg.DefaultModel, cfg.RequestTimeout.Duration(),
+		cfg.RefreshBefore.Duration(), cfg.MaxAttempts, cfg.KeepSessions)
 	if count == 0 {
 		log.Printf("no accounts stored; run `quickproxy login` to add one")
 	}
