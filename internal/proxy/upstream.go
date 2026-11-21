@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net/http"
@@ -19,7 +20,12 @@ import (
 const (
 	defaultWSPath        = "/streaming/quickwork-chat-bidirectional-stream"
 	defaultGatewayWSPath = "/ws/service/SpaceNeedleConversationService/operation/ChatBidirectionalStream"
+	maxUserMessageBytes  = 63 * 1024
 )
+
+// ErrUserMessageTooLarge means the user_message frame cannot fit under the
+// upstream 64 KB per-frame limit even after trimming older prompt text.
+var ErrUserMessageTooLarge = errors.New("user_message exceeds the upstream 64 KB frame limit")
 
 type Upstream struct {
 	cfg *config.Config
@@ -214,6 +220,9 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	}
 	if u.cfg.ThinkingEffort != "" {
 		payload["thinking_effort"] = u.cfg.ThinkingEffort
+	}
+	if err := fitUserMessage(payload); err != nil {
+		return ChatResult{}, err
 	}
 	if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
 		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
@@ -414,6 +423,8 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			Type      string          `json:"type"`
 			Payload   json.RawMessage `json:"payload"`
 			MessageID string          `json:"message_id"`
+			Message   string          `json:"message"`
+			Code      string          `json:"code"`
 			Error     string          `json:"error"`
 			ErrorCode string          `json:"error_code"`
 		}
@@ -575,10 +586,18 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			}
 		case "error", "session_error", "stream_error", "turn_failed":
 			res, _ := finish()
+			message := env.Message
+			if message == "" {
+				message = env.Error
+			}
+			code := env.Code
+			if code == "" {
+				code = env.ErrorCode
+			}
 			log.Printf("upstream %s error=%q code=%q payload=%s frame=%s",
-				env.Type, env.Error, env.ErrorCode,
+				env.Type, message, code,
 				truncateText(string(env.Payload), 1000), truncateText(jsonStr, 1500))
-			return res, fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, env.Error, env.ErrorCode))
+			return res, fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, message, code))
 		default:
 			if terminal[env.Type] {
 				return finish()
@@ -666,6 +685,53 @@ func truncateText(s string, max int) string {
 		return s
 	}
 	return s[:max] + "…"
+}
+
+func fitUserMessage(payload map[string]any) error {
+	wrap := func() ([]byte, error) {
+		return json.Marshal(map[string]any{"type": "user_message", "payload": payload})
+	}
+	body, err := wrap()
+	if err != nil {
+		return err
+	}
+	if len(body) <= maxUserMessageBytes {
+		return nil
+	}
+	original := len(body)
+	text, _ := payload["text"].(string)
+	if text == "" {
+		return fmt.Errorf("%w: system_prompt and metadata alone are %d bytes", ErrUserMessageTooLarge, len(body))
+	}
+	const marker = "\n\n[earlier conversation trimmed to fit the upstream 64 KB frame limit]\n\n"
+	bodyText := text
+	for range 5 {
+		over := len(body) - maxUserMessageBytes
+		runes := []rune(bodyText)
+		keep := len(runes) - over - len(marker) - 512
+		if keep < 0 {
+			keep = 0
+		}
+		head := keep / 4
+		if head > len(runes) {
+			head = len(runes)
+		}
+		rest := keep - head
+		if rest > len(runes)-head {
+			rest = len(runes) - head
+		}
+		bodyText = string(runes[:head]) + marker + string(runes[len(runes)-rest:])
+		payload["text"] = bodyText
+		body, err = wrap()
+		if err != nil {
+			return err
+		}
+		if len(body) <= maxUserMessageBytes {
+			log.Printf("user_message trimmed %d -> %d bytes (limit %d)", original, len(body), maxUserMessageBytes)
+			return nil
+		}
+	}
+	return fmt.Errorf("%w: %d bytes after trimming prompt", ErrUserMessageTooLarge, len(body))
 }
 
 func titleFor(prompt string) string {

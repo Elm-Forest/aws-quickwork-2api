@@ -173,6 +173,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			s.accounts.ReportFailure(ctx, acct.ID, err)
 			log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
 				id, attempt, maxAttempts, accountLogLabel(acct), err)
+			if errors.Is(err, ErrUserMessageTooLarge) {
+				break
+			}
 			if ctx.Err() != nil {
 				log.Printf("chat %s request context ended: %v", id, ctx.Err())
 				break
@@ -180,8 +183,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 		if lastErr != nil {
 			status, code := http.StatusBadGateway, "upstream_error"
-			if errors.Is(lastErr, accounts.ErrNoAccounts) {
+			switch {
+			case errors.Is(lastErr, accounts.ErrNoAccounts):
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
+			case errors.Is(lastErr, ErrUserMessageTooLarge):
+				status, code = http.StatusBadRequest, "request_too_large"
 			}
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
@@ -337,6 +343,9 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		s.accounts.ReportFailure(ctx, acct.ID, err)
 		log.Printf("chat %s attempt=%d/%d account=%s failed error=%v",
 			id, attempt, maxAttempts, accountLogLabel(acct), err)
+		if errors.Is(err, ErrUserMessageTooLarge) {
+			break
+		}
 		if started || ctx.Err() != nil {
 			if started {
 				log.Printf("chat %s stream already started; not retrying", id)
@@ -351,8 +360,11 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	if lastErr != nil {
 		if !started {
 			status, code := http.StatusBadGateway, "upstream_error"
-			if errors.Is(lastErr, accounts.ErrNoAccounts) {
+			switch {
+			case errors.Is(lastErr, accounts.ErrNoAccounts):
 				status, code = http.StatusUnauthorized, "upstream_session_unavailable"
+			case errors.Is(lastErr, ErrUserMessageTooLarge):
+				status, code = http.StatusBadRequest, "request_too_large"
 			}
 			logChatDone(id, startedAt, in, usedAccount, attempts, "failed", "", res.Usage, 0, lastErr)
 			writeOpenAIError(w, status, code, lastErr.Error())
