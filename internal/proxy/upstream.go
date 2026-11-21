@@ -27,20 +27,76 @@ func NewUpstream(cfg *Config) *Upstream {
 	return &Upstream{cfg: cfg}
 }
 
-type DeltaFunc func(string) error
+// ChatInput is one upstream turn.
+type ChatInput struct {
+	Prompt       string
+	Model        string
+	ThreadID     string
+	Title        string
+	CustomPrompt string
+}
 
-// Chat sends one prompt through the QuickWork chat bidi WebSocket and streams
-// assistant text deltas to onDelta. It returns the complete assistant text.
-func (u *Upstream) Chat(ctx context.Context, sess *Session, prompt, model, threadID string, onDelta DeltaFunc) (string, error) {
+// ToolCallState is a tool invocation reported by the QuickWork agent.
+type ToolCallState struct {
+	ID        string
+	Name      string
+	Arguments string
+	Result    string
+	Status    string
+}
+
+// Usage aggregates turn_usage events across a multi-step tool turn.
+type Usage struct {
+	PromptTokens     int
+	CompletionTokens int
+	TotalTokens      int
+	CacheReadTokens  int
+	CacheWriteTokens int
+}
+
+func (u *Usage) add(v Usage) {
+	u.PromptTokens += v.PromptTokens
+	u.CompletionTokens += v.CompletionTokens
+	u.TotalTokens += v.TotalTokens
+	u.CacheReadTokens += v.CacheReadTokens
+	u.CacheWriteTokens += v.CacheWriteTokens
+}
+
+// StreamEvent is a text delta or a completed tool call.
+type StreamEvent struct {
+	Type     string
+	Text     string
+	ToolCall *ToolCallState
+}
+
+type EventFunc func(StreamEvent) error
+
+type ChatResult struct {
+	Text      string
+	ToolCalls []ToolCallState
+	Usage     Usage
+}
+
+// Chat sends one prompt through the QuickWork chat bidi WebSocket. Text
+// deltas and completed tool calls are reported through onEvent.
+func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEvent EventFunc) (ChatResult, error) {
+	if strings.TrimSpace(in.Prompt) == "" {
+		return ChatResult{}, fmt.Errorf("prompt is empty")
+	}
+	threadID := strings.TrimSpace(in.ThreadID)
 	if threadID == "" {
 		threadID = uuid()
+	}
+	title := strings.TrimSpace(in.Title)
+	if title == "" {
+		title = titleFor(in.Prompt)
 	}
 	messageID := uuid()
 	traceID := uuid()
 
 	wsURL, headers, gateway, err := u.dialInfo(sess)
 	if err != nil {
-		return "", err
+		return ChatResult{}, err
 	}
 
 	dialer := *websocket.DefaultDialer
@@ -51,7 +107,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, prompt, model, threa
 		if resp != nil {
 			detail = fmt.Sprintf(" HTTP %d", resp.StatusCode)
 		}
-		return "", fmt.Errorf("upstream WebSocket dial failed%s: %w", detail, err)
+		return ChatResult{}, fmt.Errorf("upstream WebSocket dial failed%s: %w", detail, err)
 	}
 	defer conn.Close()
 
@@ -126,11 +182,11 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, prompt, model, threa
 	_ = send(map[string]any{"type": "federate_status", "payload": map[string]any{}})
 	_ = send(map[string]any{
 		"type":    "session_create",
-		"payload": map[string]any{"session_id": threadID, "title": titleFor(prompt)},
+		"payload": map[string]any{"session_id": threadID, "title": title},
 	})
 
 	payload := map[string]any{
-		"text":               prompt,
+		"text":               in.Prompt,
 		"send_origin":        "programmatic",
 		"had_physical_input": false,
 		"surfaceType":        sess.Surface,
@@ -139,7 +195,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, prompt, model, threa
 		"traceId":            traceID,
 		"message_id":         messageID,
 		"thread_id":          threadID,
-		"agent_mode":         model,
+		"agent_mode":         in.Model,
 		"user_timezone":      u.cfg.Timezone,
 		"user_locale":        u.cfg.Locale,
 		"chat_agent_id":      nil,
@@ -149,22 +205,31 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, prompt, model, threa
 		"preload_skills":     []any{},
 		"panel_edits":        []any{},
 	}
+	// custom_prompt is QuickWork's native per-turn prompt channel. null keeps
+	// the service default; a client system message is passed here instead of
+	// being injected into user text. QuickWork may still apply its own base
+	// system prompt.
+	if strings.TrimSpace(in.CustomPrompt) != "" {
+		payload["custom_prompt"] = in.CustomPrompt
+	} else {
+		payload["custom_prompt"] = nil
+	}
 	if u.cfg.ThinkingEffort != "" && u.cfg.ThinkingEffort != "off" {
 		payload["thinking_effort"] = u.cfg.ThinkingEffort
 	}
 	if err := send(map[string]any{"type": "user_message", "payload": payload}); err != nil {
-		return "", fmt.Errorf("send user_message: %w", err)
+		return ChatResult{}, fmt.Errorf("send user_message: %w", err)
 	}
 
-	text, err := u.readEvents(ctx, conn, gateway, onDelta)
+	result, err := u.readEvents(ctx, conn, gateway, onEvent)
 	if err != nil {
-		return text, err
+		return result, err
 	}
 
 	if !u.cfg.KeepSessions {
 		_ = send(map[string]any{"type": "session_delete", "payload": map[string]any{"session_id": threadID}})
 	}
-	return text, nil
+	return result, nil
 }
 
 func (u *Upstream) dialInfo(sess *Session) (wsURL string, headers http.Header, gateway bool, err error) {
@@ -225,6 +290,7 @@ func (u *Upstream) dialInfo(sess *Session) (wsURL string, headers http.Header, g
 
 	headers = http.Header{}
 	headers.Set("Authorization", "Bearer "+jwt)
+	headers.Set("Origin", "file://")
 	headers.Set("X-Surface-Type", sess.Surface)
 	headers.Set("X-Outpost-Id", sess.OutpostID)
 	headers.Set("X-Agent-Service-Type", "UNIFIED_QUICK")
@@ -234,10 +300,80 @@ func (u *Upstream) dialInfo(sess *Session) (wsURL string, headers http.Header, g
 	return parsed.String(), headers, gateway, nil
 }
 
-func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway bool, onDelta DeltaFunc) (string, error) {
+func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway bool, onEvent EventFunc) (ChatResult, error) {
+	var result ChatResult
 	var text strings.Builder
 	sawMessageComplete := false
 	var completeDeadline time.Time
+
+	toolCalls := make(map[string]*ToolCallState)
+	toolOrder := make([]string, 0, 2)
+	toolSent := make(map[string]bool)
+	partialArgs := make(map[string]string)
+
+	getTool := func(id, name string) *ToolCallState {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			id = "call_" + strings.ReplaceAll(uuid(), "-", "")
+		}
+		tc := toolCalls[id]
+		if tc == nil {
+			tc = &ToolCallState{ID: id}
+			toolCalls[id] = tc
+			toolOrder = append(toolOrder, id)
+		}
+		if n := strings.TrimSpace(name); n != "" {
+			tc.Name = n
+		}
+		return tc
+	}
+	emitTool := func(tc *ToolCallState) error {
+		if tc == nil || onEvent == nil || toolSent[tc.ID] {
+			return nil
+		}
+		toolSent[tc.ID] = true
+		copy := *tc
+		return onEvent(StreamEvent{Type: "tool_call", ToolCall: &copy})
+	}
+	emitToolUpdate := func(tc *ToolCallState) error {
+		if tc == nil || onEvent == nil {
+			return nil
+		}
+		copy := *tc
+		return onEvent(StreamEvent{Type: "tool_call_update", ToolCall: &copy})
+	}
+	emitOrUpdate := func(tc *ToolCallState) error {
+		if toolSent[tc.ID] {
+			return emitToolUpdate(tc)
+		}
+		return emitTool(tc)
+	}
+	finish := func() (ChatResult, error) {
+		result.Text = text.String()
+		result.ToolCalls = result.ToolCalls[:0]
+		for _, id := range toolOrder {
+			tc := toolCalls[id]
+			if tc == nil {
+				continue
+			}
+			if strings.TrimSpace(tc.Name) == "" {
+				tc.Name = "unknown"
+			}
+			if strings.TrimSpace(tc.Arguments) == "" {
+				if p := strings.TrimSpace(partialArgs[id]); p != "" && json.Valid([]byte(p)) {
+					tc.Arguments = p
+				} else {
+					tc.Arguments = "{}"
+				}
+			}
+			result.ToolCalls = append(result.ToolCalls, *tc)
+			if err := emitTool(tc); err != nil {
+				return result, err
+			}
+		}
+		return result, nil
+	}
+
 	terminal := map[string]bool{
 		"turn_completed": true,
 		"turn_aborted":   true,
@@ -248,7 +384,8 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 	for {
 		select {
 		case <-ctx.Done():
-			return text.String(), ctx.Err()
+			res, _ := finish()
+			return res, ctx.Err()
 		default:
 		}
 		readWait := 2 * time.Minute
@@ -256,16 +393,20 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			if remaining := time.Until(completeDeadline); remaining > 0 {
 				readWait = remaining
 			} else {
-				return text.String(), nil
+				return finish()
 			}
 		}
 		_ = conn.SetReadDeadline(time.Now().Add(readWait))
 		msgType, data, err := conn.ReadMessage()
 		if err != nil {
-			if text.Len() > 0 {
-				return text.String(), nil
+			res, emitErr := finish()
+			if emitErr != nil {
+				return res, emitErr
 			}
-			return "", fmt.Errorf("upstream WebSocket read: %w", err)
+			if text.Len() > 0 || len(toolOrder) > 0 {
+				return res, nil
+			}
+			return res, fmt.Errorf("upstream WebSocket read: %w", err)
 		}
 
 		var jsonStr string
@@ -300,9 +441,10 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				continue
 			}
 			text.WriteString(delta)
-			if onDelta != nil {
-				if err := onDelta(delta); err != nil {
-					return text.String(), err
+			if onEvent != nil {
+				if err := onEvent(StreamEvent{Type: "text", Text: delta}); err != nil {
+					res, _ := finish()
+					return res, err
 				}
 			}
 		case "text_complete":
@@ -313,30 +455,252 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 				_ = json.Unmarshal(env.Payload, &p)
 				if p.Text != "" {
 					text.WriteString(p.Text)
-					if onDelta != nil {
-						if err := onDelta(p.Text); err != nil {
-							return text.String(), err
+					if onEvent != nil {
+						if err := onEvent(StreamEvent{Type: "text", Text: p.Text}); err != nil {
+							res, _ := finish()
+							return res, err
 						}
 					}
 				}
 			}
 			sawMessageComplete = true
+		case "turn_usage":
+			var p struct {
+				InputTokens      int `json:"input_tokens"`
+				OutputTokens     int `json:"output_tokens"`
+				TotalTokens      int `json:"total_tokens"`
+				CacheReadTokens  int `json:"cache_read_tokens"`
+				CacheWriteTokens int `json:"cache_write_tokens"`
+			}
+			if err := json.Unmarshal(env.Payload, &p); err == nil {
+				result.Usage.add(Usage{
+					PromptTokens:     p.InputTokens,
+					CompletionTokens: p.OutputTokens,
+					TotalTokens:      p.TotalTokens,
+					CacheReadTokens:  p.CacheReadTokens,
+					CacheWriteTokens: p.CacheWriteTokens,
+				})
+			}
+		case "tool_start":
+			var p struct {
+				ToolName   string          `json:"tool_name"`
+				ToolID     string          `json:"tool_id"`
+				ToolCallID string          `json:"tool_call_id"`
+				Arguments  json.RawMessage `json:"arguments"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			tc := getTool(id, p.ToolName)
+			if args := argumentString(p.Arguments); args != "{}" {
+				tc.Arguments = args
+			}
+		case "tool_arguments", "tool_arguments_edited":
+			var p struct {
+				ToolID     string          `json:"tool_id"`
+				ToolCallID string          `json:"tool_call_id"`
+				ToolName   string          `json:"tool_name"`
+				Arguments  json.RawMessage `json:"arguments"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			tc := getTool(id, p.ToolName)
+			if len(p.Arguments) > 0 {
+				tc.Arguments = argumentString(p.Arguments)
+			}
+			if err := emitOrUpdate(tc); err != nil {
+				res, _ := finish()
+				return res, err
+			}
+		case "tool_progress":
+			var p struct {
+				ToolID     string `json:"tool_id"`
+				ToolCallID string `json:"tool_call_id"`
+				InputDelta string `json:"input_delta"`
+				Progress   struct {
+					InputDelta string `json:"input_delta"`
+				} `json:"progress"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			delta := p.InputDelta
+			if delta == "" {
+				delta = p.Progress.InputDelta
+			}
+			if id != "" && delta != "" {
+				partialArgs[id] += delta
+			}
+		case "tool_result":
+			var p struct {
+				ToolID     string          `json:"tool_id"`
+				ToolCallID string          `json:"tool_call_id"`
+				ToolName   string          `json:"tool_name"`
+				Arguments  json.RawMessage `json:"arguments"`
+				Result     json.RawMessage `json:"result"`
+				Error      string          `json:"error"`
+				Status     string          `json:"status"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			tc := getTool(id, p.ToolName)
+			if len(p.Arguments) > 0 {
+				tc.Arguments = argumentString(p.Arguments)
+			}
+			tc.Result = rawText(p.Result)
+			if p.Error != "" {
+				tc.Result = p.Error
+				tc.Status = "error"
+			} else {
+				tc.Status = p.Status
+			}
+			if err := emitTool(tc); err != nil {
+				res, _ := finish()
+				return res, err
+			}
+		case "tool_error":
+			var p struct {
+				ToolID     string `json:"tool_id"`
+				ToolCallID string `json:"tool_call_id"`
+				ToolName   string `json:"tool_name"`
+				Error      string `json:"error"`
+				Message    string `json:"message"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			tc := getTool(id, p.ToolName)
+			tc.Status = "error"
+			tc.Result = p.Error
+			if tc.Result == "" {
+				tc.Result = p.Message
+			}
+			if err := emitTool(tc); err != nil {
+				res, _ := finish()
+				return res, err
+			}
+		case "tool_complete":
+			var p struct {
+				ToolID     string `json:"tool_id"`
+				ToolCallID string `json:"tool_call_id"`
+				ToolName   string `json:"tool_name"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			tc := getTool(id, p.ToolName)
+			if tc.Status == "" {
+				tc.Status = "complete"
+			}
+			if err := emitTool(tc); err != nil {
+				res, _ := finish()
+				return res, err
+			}
+		case "tool_call", "tool_call_update":
+			var p struct {
+				ToolCallID      string          `json:"toolCallId"`
+				ToolCallIDSnake string          `json:"tool_call_id"`
+				ToolID          string          `json:"tool_id"`
+				ToolName        string          `json:"tool_name"`
+				Title           string          `json:"title"`
+				RawInput        json.RawMessage `json:"rawInput"`
+				RawInputSnake   json.RawMessage `json:"raw_input"`
+				Arguments       json.RawMessage `json:"arguments"`
+			}
+			_ = json.Unmarshal(env.Payload, &p)
+			id := p.ToolID
+			if id == "" {
+				id = p.ToolCallID
+			}
+			if id == "" {
+				id = p.ToolCallIDSnake
+			}
+			name := p.ToolName
+			if name == "" {
+				name = p.Title
+			}
+			tc := getTool(id, name)
+			args := p.RawInput
+			if len(args) == 0 {
+				args = p.RawInputSnake
+			}
+			if len(args) == 0 {
+				args = p.Arguments
+			}
+			if len(args) > 0 {
+				tc.Arguments = argumentString(args)
+			}
+			if err := emitOrUpdate(tc); err != nil {
+				res, _ := finish()
+				return res, err
+			}
 		case "message_complete":
 			sawMessageComplete = true
 			var p struct {
 				ContinuationExpected bool `json:"continuation_expected"`
+				ToolCalls            []struct {
+					ID         string          `json:"id"`
+					ToolCallID string          `json:"tool_call_id"`
+					Name       string          `json:"name"`
+					ToolName   string          `json:"tool_name"`
+					Arguments  json.RawMessage `json:"arguments"`
+					Function   struct {
+						Name      string          `json:"name"`
+						Arguments json.RawMessage `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			}
 			_ = json.Unmarshal(env.Payload, &p)
+			for _, item := range p.ToolCalls {
+				id := item.ID
+				if id == "" {
+					id = item.ToolCallID
+				}
+				name := item.Name
+				if name == "" {
+					name = item.ToolName
+				}
+				if name == "" {
+					name = item.Function.Name
+				}
+				tc := getTool(id, name)
+				args := item.Arguments
+				if len(args) == 0 {
+					args = item.Function.Arguments
+				}
+				if len(args) > 0 {
+					tc.Arguments = argumentString(args)
+				}
+				if err := emitTool(tc); err != nil {
+					res, _ := finish()
+					return res, err
+				}
+			}
 			if p.ContinuationExpected {
 				completeDeadline = time.Time{}
 			} else {
 				completeDeadline = time.Now().Add(5 * time.Second)
 			}
 		case "error", "session_error", "stream_error", "turn_failed":
-			return text.String(), fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, env.Error, env.ErrorCode))
+			res, _ := finish()
+			return res, fmt.Errorf("upstream %s: %s", env.Type, errorText(env.Payload, env.Error, env.ErrorCode))
 		default:
 			if terminal[env.Type] {
-				return text.String(), nil
+				return finish()
 			}
 			if env.Type == "ping" {
 				// Best effort pong; ignore errors.
@@ -353,6 +717,10 @@ func deltaText(raw json.RawMessage) string {
 	if len(raw) == 0 {
 		return ""
 	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
 	var p struct {
 		Delta string `json:"delta"`
 		Text  string `json:"text"`
@@ -364,6 +732,17 @@ func deltaText(raw json.RawMessage) string {
 		return p.Delta
 	}
 	return p.Text
+}
+
+func rawText(raw json.RawMessage) string {
+	if len(raw) == 0 {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return s
+	}
+	return string(raw)
 }
 
 func errorText(raw json.RawMessage, fallback, code string) string {

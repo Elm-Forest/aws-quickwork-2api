@@ -14,6 +14,10 @@
 - `refresh` 命令刷新 token，无需重新打开浏览器
 - 可选本地 API key 保护
 - 默认每轮对话结束后删除上游会话，避免污染聊天列表
+- 保留 `assistant.tool_calls` / `role: tool` 历史，客户端工具调用链不会丢上下文
+- 当客户端声明同名 `tools` 时，把上游 `tool_start` / `tool_arguments` / `tool_result` 转成 OpenAI `tool_calls`
+- 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
+- `system` / `developer` 消息通过 QuickWork 原生 `custom_prompt` 发送，不拼进 user 文本
 
 ## 环境要求
 
@@ -183,6 +187,15 @@ sequenceDiagram
 - `quickproxy` 使用 `session.json` 中的 `jwt`、`ws_host` 和 `provider` 连接上游 WebSocket。
 - 上游不是 OpenAI HTTP API，而是 WebSocket JSON 帧；本项目的 `internal/proxy/wire.go` 负责帧编码与 event-stream 解码。
 
+### 提示词与工具调用
+
+- `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.custom_prompt`，不会重复塞进 `text`，也不会添加额外指令。
+- QuickWork 服务端仍会使用自己的基础 system prompt。当前 WebSocket 协议没有关闭服务端 prompt 的字段；`custom_prompt` 是客户端提示词的原生通道，但不保证删除服务端提示词。
+- 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果，供上游继续推理。
+- 客户端在 `tools` / `functions` 中声明的工具不会由本代理执行。只有上游 agent 调用**同名工具**时，代理才会返回 OpenAI `tool_calls`；其他上游工具调用保持内部执行，只返回最终文本。
+- 非流式响应中，工具调用放在 `choices[0].message.tool_calls`；只有工具调用且没有最终文本时 `finish_reason` 才是 `tool_calls`，否则为 `stop`。
+- 流式响应中，工具调用以一个完整的 `arguments` 块发出；文本继续按 `text_delta` 原样转发。
+
 ## 安全与隐私
 
 - `data/` 包含 access token、refresh token、client secret 和用户信息，已被 `.gitignore` 排除，权限尽量设为 `0600`。
@@ -193,7 +206,9 @@ sequenceDiagram
 
 ## 限制
 
-- 只实现聊天补全。`temperature`、`max_tokens`、tools、`n > 1` 等参数不支持；`n > 1` 会返回 400。
+- 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
+- 客户端 `tools` / `functions` 不会由代理执行。只有上游 agent 调用同名工具时才会出现 OpenAI `tool_calls`；`tool_choice: "none"` 会隐藏所有工具调用。
+- 当前 WebSocket 协议没有关闭 QuickWork 服务端 system prompt 的字段。`custom_prompt` 是客户端提示词的原生通道，但实测服务端基础 prompt 仍然存在，无法做到真正的“删除后替换”。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
 - social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。
