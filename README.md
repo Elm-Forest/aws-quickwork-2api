@@ -77,7 +77,9 @@ https://quick.aws.com/sn?qwSurface=desktop:<nonce>:18080:1.2.4660
 4. 浏览器会跳转到 `http://127.0.0.1:18080/?code=...`；同样复制地址栏的完整 URL，粘贴回终端。
 5. 工具完成 token 交换并写入 SQLite。
 
-整个过程不需要服务器开放回调端口；回调端口只用于生成浏览器地址。也可以把两段 callback URL 通过 stdin 管道传入，便于脚本化。
+工具会根据 URL 参数自动判断阶段：`nonce=...` 是 discovery callback，`code=...&state=...` 是授权完成 callback。贴入 authorize URL、discovery URL、重复的 discovery callback 或带 fragment 的 callback 都会被识别并提示下一步，不会重复注册 OAuth client。
+
+整个过程不需要服务器开放回调端口；回调端口只用于生成浏览器地址。也可以把 callback URL 通过 stdin 管道传入，便于脚本化。
 
 ### 3. 启动反代
 
