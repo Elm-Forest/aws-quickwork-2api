@@ -107,6 +107,24 @@ for chunk in client.chat.completions.create(
     print(chunk.choices[0].delta.content or "", end="")
 ```
 
+## 发布
+
+推送 `v*` tag 会触发 `.github/workflows/release.yml`，构建并发布：
+
+| 平台 | 架构 | 产物 |
+|---|---|---|
+| Windows | amd64 | `quickproxy-windows-amd64.exe` |
+| Windows | arm64 | `quickproxy-windows-arm64.exe` |
+| Linux | amd64 | `quickproxy-linux-amd64` |
+| Linux | arm64 | `quickproxy-linux-arm64` |
+
+同时生成 `SHA256SUMS`。手动运行该 workflow 只上传 Actions artifacts，不创建 release。
+
+```bash
+git tag -a v0.2.0 -m "v0.2.0"
+git push origin v0.2.0
+```
+
 ## 命令
 
 ### 登录与凭据
