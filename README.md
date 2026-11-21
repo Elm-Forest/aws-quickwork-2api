@@ -17,7 +17,7 @@
 - 保留 `assistant.tool_calls` / `role: tool` 历史，客户端工具调用链不会丢上下文
 - 当客户端声明同名 `tools` 时，把上游 `tool_start` / `tool_arguments` / `tool_result` 转成 OpenAI `tool_calls`
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
-- `system` / `developer` 消息通过 QuickWork 原生 `custom_prompt` 发送，不拼进 user 文本
+- `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，不拼进 user 文本，也不做提示词注入
 
 ## 环境要求
 
@@ -207,8 +207,9 @@ sequenceDiagram
 
 ### 提示词与工具调用
 
-- `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.custom_prompt`，不会重复塞进 `text`，也不会添加额外指令。
-- QuickWork 服务端仍会使用自己的基础 system prompt。当前 WebSocket 协议没有关闭服务端 prompt 的字段；`custom_prompt` 是客户端提示词的原生通道，但不保证删除服务端提示词。
+- `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.system_prompt`。
+- 非空 `system_prompt` 会覆盖 QuickWork 服务端基础 system prompt；未提供时保留服务端默认。已验证 social 路径，enterprise / gateway 仍待逐项验证。
+- 不会添加“ignore previous instructions”等额外指令，也不会把 system prompt 塞进 user 文本。
 - 客户端历史中的 `assistant.tool_calls` 会转成带 `id` / `name` 的文本，`role: tool` 会转成带 `call_id` / `name` 的工具结果，供上游继续推理。
 - 客户端在 `tools` / `functions` 中声明的工具不会由本代理执行。只有上游 agent 调用**同名工具**时，代理才会返回 OpenAI `tool_calls`；其他上游工具调用保持内部执行，只返回最终文本。
 - 非流式响应中，工具调用放在 `choices[0].message.tool_calls`；只有工具调用且没有最终文本时 `finish_reason` 才是 `tool_calls`，否则为 `stop`。
@@ -226,7 +227,7 @@ sequenceDiagram
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
 - 客户端 `tools` / `functions` 不会由代理执行。只有上游 agent 调用同名工具时才会出现 OpenAI `tool_calls`；`tool_choice: "none"` 会隐藏所有工具调用。
-- 当前 WebSocket 协议没有关闭 QuickWork 服务端 system prompt 的字段。`custom_prompt` 是客户端提示词的原生通道，但实测服务端基础 prompt 仍然存在，无法做到真正的“删除后替换”。
+- `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息会保留服务端默认提示词。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
 - social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。

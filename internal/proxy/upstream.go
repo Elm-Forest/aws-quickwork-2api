@@ -33,7 +33,7 @@ type ChatInput struct {
 	Model        string
 	ThreadID     string
 	Title        string
-	CustomPrompt string
+	SystemPrompt string
 }
 
 // ToolCallState is a tool invocation reported by the QuickWork agent.
@@ -204,15 +204,13 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 		"pre_approved_tools": []any{},
 		"preload_skills":     []any{},
 		"panel_edits":        []any{},
+		"custom_prompt":      nil,
 	}
-	// custom_prompt is QuickWork's native per-turn prompt channel. null keeps
-	// the service default; a client system message is passed here instead of
-	// being injected into user text. QuickWork may still apply its own base
-	// system prompt.
-	if strings.TrimSpace(in.CustomPrompt) != "" {
-		payload["custom_prompt"] = in.CustomPrompt
-	} else {
-		payload["custom_prompt"] = nil
+	// system_prompt is the native per-turn override. When the client supplies
+	// system/developer messages, it replaces QuickWork's base prompt; when it
+	// is absent, the service default remains. No injection text is added.
+	if strings.TrimSpace(in.SystemPrompt) != "" {
+		payload["system_prompt"] = in.SystemPrompt
 	}
 	if u.cfg.ThinkingEffort != "" && u.cfg.ThinkingEffort != "off" {
 		payload["thinking_effort"] = u.cfg.ThinkingEffort

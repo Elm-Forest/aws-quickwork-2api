@@ -99,7 +99,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
 		return
 	}
-	customPrompt := systemPrompt(req.Messages)
+	systemPromptText := systemPrompt(req.Messages)
 	model := s.mapModel(req.Model)
 	allowedTools := requestedToolNames(&req)
 	choiceMode, choiceName := parseToolChoice(req.ToolChoice)
@@ -130,7 +130,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Model:        model,
 		ThreadID:     threadID,
 		Title:        titleFor(lastUserText(req.Messages)),
-		CustomPrompt: customPrompt,
+		SystemPrompt: systemPromptText,
 	}
 
 	if !req.Stream {
