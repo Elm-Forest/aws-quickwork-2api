@@ -60,7 +60,7 @@ Usage:
   quickproxy serve    [-config config.json]
   quickproxy login    [-config config.json] [-provider social|enterprise|gateway|social_gateway]
                       [-stage prod|beta|integ|dev] [-region REGION] [-port 18080]
-                      [-timeout 1h] [-open]
+                      [-timeout 1h] [-open] [-manual]
   quickproxy accounts [-config config.json]
   quickproxy refresh  [-config config.json] [-account ID]
   quickproxy logout   [-config config.json] (-all | -account ID)
@@ -151,6 +151,7 @@ func login(args []string) int {
 	port := fs.Int("port", 0, "localhost callback port (default from config)")
 	timeout := fs.Duration("timeout", 0, "wait duration for the browser callback (default from config)")
 	open := fs.Bool("open", false, "open the login URL in the default browser")
+	manual := fs.Bool("manual", false, "paste browser callback URLs manually (for servers without a reachable localhost)")
 	_ = fs.Parse(args)
 
 	cfg, err := loadConfig(*configPath)
@@ -181,7 +182,7 @@ func login(args []string) int {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	logger := log.New(os.Stdout, "[login] ", 0)
-	acct, err := oauth.Login(ctx, oauth.LoginOptions{
+	opts := oauth.LoginOptions{
 		Provider:    *provider,
 		Stage:       *stage,
 		Region:      *region,
@@ -190,7 +191,13 @@ func login(args []string) int {
 		AppVersion:  cfg.AppVersion,
 		OpenBrowser: *open,
 		Logf:        logger.Printf,
-	}, st)
+	}
+	var acct *store.Account
+	if *manual {
+		acct, err = oauth.LoginManual(ctx, opts, st, os.Stdin, os.Stdout)
+	} else {
+		acct, err = oauth.Login(ctx, opts, st)
+	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "[login] failed:", err)
 		return 1

@@ -11,6 +11,7 @@
 - `POST /v1/chat/completions`，支持流式（SSE）与非流式响应
 - `GET /v1/models`，返回本地模型别名
 - 原生 social 登录（AWS IAM Identity Center OIDC）与企业 OIDC 登录，使用 PKCE
+- 支持服务器/远程登录：手动粘贴浏览器 callback URL，无需开放本地回调端口
 - 服务端配置集中存放在 `config.json`
 - 账号存放在 SQLite（`data/quickwork.db`），支持多账号轮询与自动刷新
 - 请求按轮询选择账号；到期 token 自动 refresh；失败时切换到下一个账号重试
@@ -59,6 +60,24 @@ https://quick.aws.com/sn?qwSurface=desktop:<nonce>:18080:1.2.4660
 ```
 
 需要登录多个账号时，重复执行 `login` 即可。相同 email + tenant 的账号会更新，不会重复插入。
+
+#### 服务器 / 远程登录（手动回填 callback URL）
+
+如果 `quickproxy` 跑在服务器上，浏览器访问不到服务器的 `localhost:18080`，使用手动模式：
+
+```bash
+./bin/quickproxy login -manual
+```
+
+流程：
+
+1. 终端打印 discovery URL，在任意机器用浏览器打开并登录。
+2. 浏览器会跳转到 `http://localhost:18080/callback?...`。这个页面可能打不开，属正常现象；从地址栏复制**完整 URL**，粘贴回终端。
+3. 终端会打印 authorize URL；继续在浏览器打开并完成登录。
+4. 浏览器会跳转到 `http://127.0.0.1:18080/?code=...`；同样复制地址栏的完整 URL，粘贴回终端。
+5. 工具完成 token 交换并写入 SQLite。
+
+整个过程不需要服务器开放回调端口；回调端口只用于生成浏览器地址。也可以把两段 callback URL 通过 stdin 管道传入，便于脚本化。
 
 ### 3. 启动反代
 
@@ -194,6 +213,7 @@ for chunk in client.chat.completions.create(
 | `-port` | `config.oauth.callback_port` | 本机回调端口 |
 | `-timeout` | `config.oauth.timeout` | 等待浏览器完成登录的超时 |
 | `-open` | 关闭 | 同时用默认浏览器打开 URL |
+| `-manual` | 关闭 | 不监听本地回调端口，手动粘贴浏览器地址栏中的 callback URL（适合服务器） |
 
 ## 多账号轮询
 
@@ -275,7 +295,8 @@ sequenceDiagram
 | 现象 | 处理 |
 |---|---|
 | `cannot listen on 127.0.0.1:18080` | 关闭占用 18080 的其他进程，或用 `-port` / `oauth.callback_port` 换端口 |
-| 浏览器登录后一直等待 | 确认浏览器与命令在同一台机器，且回调端口可达；不要关闭终端 |
+| 浏览器登录后一直等待 | 确认浏览器与命令在同一台机器，且回调端口可达；远程服务器请用 `login -manual` |
+| 服务器上 `localhost:18080` 回调打不开 | 这是预期现象；用 `login -manual`，复制浏览器地址栏的完整 URL 回填 |
 | `upstream_session_unavailable` / `no accounts configured` | 运行 `quickproxy login` |
 | `401 invalid_api_key` | 检查 `config.json` 的 `api_keys` 与请求头中的 key 是否一致 |
 | 登录页面报错 | 查看终端输出的错误；确认 `-provider` 与账号类型匹配 |

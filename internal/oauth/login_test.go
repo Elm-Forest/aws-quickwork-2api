@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -280,5 +281,115 @@ func TestRefreshUsesStoredEndpointAndClearsError(t *testing.T) {
 	}
 	if got.ExpiresAt <= time.Now().Unix() {
 		t.Fatalf("expires_at not updated: %d", got.ExpiresAt)
+	}
+}
+
+func TestParseCallbackURL(t *testing.T) {
+	tests := []struct {
+		in      string
+		key     string
+		want    string
+		wantErr bool
+	}{
+		{"http://localhost:18080/callback?nonce=abc&issuerUrl=https%3A%2F%2Fidc.example", "nonce", "abc", false},
+		{"http://localhost:18080/callback?nonce=abc&amp;idcRegion=us-east-1", "idcRegion", "us-east-1", false},
+		{"nonce=abc&tenantUrl=https%3A%2F%2Ftenant.example", "nonce", "abc", false},
+		{"?code=code-1&state=state-1", "code", "code-1", false},
+		{"http://127.0.0.1:18080/?code=code-1&state=state-1", "state", "state-1", false},
+		{"localhost:18080/callback?nonce=abc", "nonce", "abc", false},
+		{"http://localhost:18080/callback", "", "", true},
+		{"", "", "", true},
+	}
+	for _, tc := range tests {
+		got, err := parseCallbackURL(tc.in)
+		if tc.wantErr {
+			if err == nil {
+				t.Errorf("parseCallbackURL(%q) expected error", tc.in)
+			}
+			continue
+		}
+		if err != nil {
+			t.Errorf("parseCallbackURL(%q): %v", tc.in, err)
+			continue
+		}
+		if got.Get(tc.key) != tc.want {
+			t.Errorf("parseCallbackURL(%q)[%s] = %q want %q", tc.in, tc.key, got.Get(tc.key), tc.want)
+		}
+	}
+}
+
+func TestManualLoginFlow(t *testing.T) {
+	st := testStore(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		writeJSON(t, w, map[string]any{
+			"access_token":  "manual-access",
+			"refresh_token": "manual-refresh",
+			"id_token":      "manual-id",
+			"expires_in":    3600,
+		})
+	})
+	mux.HandleFunc("/integration/quick-work/user-info", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(t, w, map[string]any{"userInfo": map[string]any{
+			"email":        "manual@example.com",
+			"userArn":      "arn:aws:quicksight:us-east-1:111:user/default/manual",
+			"awsAccountId": "111",
+		}})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+
+	f := &loginFlow{
+		opts:        LoginOptions{Logf: t.Logf},
+		store:       st,
+		provider:    "enterprise",
+		stage:       "prod",
+		region:      "us-east-1",
+		port:        18080,
+		redirectURI: "http://localhost:18080",
+		state:       "manual-state",
+		nonce:       "manual-nonce",
+		verifier:    "manual-verifier",
+		challenge:   "manual-challenge",
+	}
+	discoveryCallback := "http://localhost:18080/callback?" + url.Values{
+		"nonce":         {"manual-nonce"},
+		"authEndpoint":  {srv.URL + "/authorize"},
+		"tokenEndpoint": {srv.URL + "/token"},
+		"clientId":      {"manual-client"},
+		"tenantUrl":     {srv.URL},
+		"region":        {"us-east-1"},
+	}.Encode()
+	codeCallback := "http://localhost:18080/?" + url.Values{
+		"state": {"manual-state"},
+		"code":  {"manual-code"},
+	}.Encode()
+
+	opts := normalizeLoginOptions(LoginOptions{
+		Provider: "enterprise",
+		Stage:    "prod",
+		Port:     18080,
+		Timeout:  5 * time.Second,
+		Logf:     t.Logf,
+	})
+	var out bytes.Buffer
+	acct, err := runManualLogin(context.Background(), opts, f,
+		strings.NewReader(discoveryCallback+"\n"+codeCallback+"\n"), &out)
+	if err != nil {
+		t.Fatalf("manual login: %v\noutput:\n%s", err, out.String())
+	}
+	if !strings.Contains(out.String(), "Open this URL to continue signing in:") {
+		t.Fatalf("missing authorize prompt:\n%s", out.String())
+	}
+	if !strings.Contains(out.String(), "Login complete: manual@example.com") {
+		t.Fatalf("missing completion message:\n%s", out.String())
+	}
+	saved, err := st.Get(context.Background(), acct.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Email != "manual@example.com" || saved.AccessToken != "manual-access" {
+		t.Fatalf("unexpected saved account: %+v", saved)
 	}
 }

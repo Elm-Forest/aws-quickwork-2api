@@ -1,6 +1,7 @@
 package oauth
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -64,20 +65,9 @@ type loginFlow struct {
 // Login runs the native browser OAuth flow and stores the resulting account.
 // It returns once the browser callback completes, fails, or the context ends.
 func Login(ctx context.Context, opts LoginOptions, st *store.Store) (*store.Account, error) {
+	opts = normalizeLoginOptions(opts)
 	provider := normalizedProvider(opts.Provider)
 	stage := normalizedStage(opts.Stage)
-	if opts.Port <= 0 {
-		opts.Port = 18080
-	}
-	if opts.Timeout <= 0 {
-		opts.Timeout = time.Hour
-	}
-	if opts.AppVersion == "" {
-		opts.AppVersion = "1.2.4660"
-	}
-	if opts.Logf == nil {
-		opts.Logf = func(string, ...any) {}
-	}
 
 	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", opts.Port))
 	if err != nil {
@@ -86,32 +76,9 @@ func Login(ctx context.Context, opts LoginOptions, st *store.Store) (*store.Acco
 	defer ln.Close()
 	port := ln.Addr().(*net.TCPAddr).Port
 
-	state, err := randomToken()
+	f, err := newLoginFlow(opts, st, port)
 	if err != nil {
 		return nil, err
-	}
-	nonce, err := randomToken()
-	if err != nil {
-		return nil, err
-	}
-	verifier, err := randomToken()
-	if err != nil {
-		return nil, err
-	}
-	sum := sha256.Sum256([]byte(verifier))
-	f := &loginFlow{
-		opts:        opts,
-		store:       st,
-		provider:    provider,
-		stage:       stage,
-		region:      strings.TrimSpace(opts.Region),
-		port:        port,
-		redirectURI: redirectURI(provider, port),
-		state:       state,
-		nonce:       nonce,
-		verifier:    verifier,
-		challenge:   base64.RawURLEncoding.EncodeToString(sum[:]),
-		done:        make(chan struct{}),
 	}
 
 	srv := &http.Server{
@@ -129,7 +96,7 @@ func Login(ctx context.Context, opts LoginOptions, st *store.Store) (*store.Acco
 		_ = srv.Shutdown(shutdownCtx)
 	}()
 
-	loginURL := discoveryURL(provider, stage, f.region, nonce, port, opts.AppVersion)
+	loginURL := discoveryURL(provider, stage, f.region, f.nonce, port, opts.AppVersion)
 	opts.Logf("provider=%s stage=%s listening=127.0.0.1:%d", provider, stage, port)
 	opts.Logf("Open this URL to sign in:")
 	opts.Logf("%s", loginURL)
@@ -149,11 +116,198 @@ func Login(ctx context.Context, opts LoginOptions, st *store.Store) (*store.Acco
 		}
 		return f.acct, nil
 	case <-waitCtx.Done():
-		if errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
-			return nil, errors.New("timed out waiting for browser callback")
-		}
-		return nil, waitCtx.Err()
+		return nil, waitError(waitCtx)
 	}
+}
+
+func normalizeLoginOptions(opts LoginOptions) LoginOptions {
+	if opts.Port <= 0 {
+		opts.Port = 18080
+	}
+	if opts.Timeout <= 0 {
+		opts.Timeout = time.Hour
+	}
+	if opts.AppVersion == "" {
+		opts.AppVersion = "1.2.4660"
+	}
+	if opts.Logf == nil {
+		opts.Logf = func(string, ...any) {}
+	}
+	return opts
+}
+
+func newLoginFlow(opts LoginOptions, st *store.Store, port int) (*loginFlow, error) {
+	state, err := randomToken()
+	if err != nil {
+		return nil, err
+	}
+	nonce, err := randomToken()
+	if err != nil {
+		return nil, err
+	}
+	verifier, err := randomToken()
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256([]byte(verifier))
+	provider := normalizedProvider(opts.Provider)
+	return &loginFlow{
+		opts:        opts,
+		store:       st,
+		provider:    provider,
+		stage:       normalizedStage(opts.Stage),
+		region:      strings.TrimSpace(opts.Region),
+		port:        port,
+		redirectURI: redirectURI(provider, port),
+		state:       state,
+		nonce:       nonce,
+		verifier:    verifier,
+		challenge:   base64.RawURLEncoding.EncodeToString(sum[:]),
+		done:        make(chan struct{}),
+	}, nil
+}
+
+func waitError(ctx context.Context) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return errors.New("timed out waiting for browser callback")
+	}
+	return ctx.Err()
+}
+
+// LoginManual runs the same OAuth flow without listening for browser
+// callbacks. The user opens the discovery URL on any machine, then pastes the
+// callback URLs from the browser address bar. This supports logging in on a
+// remote server whose localhost is not reachable by the browser.
+func LoginManual(ctx context.Context, opts LoginOptions, st *store.Store, in io.Reader, out io.Writer) (*store.Account, error) {
+	opts = normalizeLoginOptions(opts)
+	f, err := newLoginFlow(opts, st, opts.Port)
+	if err != nil {
+		return nil, err
+	}
+	return runManualLogin(ctx, opts, f, in, out)
+}
+
+func runManualLogin(ctx context.Context, opts LoginOptions, f *loginFlow, in io.Reader, out io.Writer) (*store.Account, error) {
+	if out == nil {
+		out = io.Discard
+	}
+	provider := normalizedProvider(opts.Provider)
+	stage := normalizedStage(opts.Stage)
+
+	loginURL := discoveryURL(provider, stage, f.region, f.nonce, opts.Port, opts.AppVersion)
+	fmt.Fprintf(out, "Open this URL to sign in:\n%s\n", loginURL)
+	fmt.Fprintln(out, "After the browser redirects, copy the full URL from the address bar and paste it here.")
+	fmt.Fprintln(out, "(The localhost page may fail to load; the URL in the address bar is what matters.)")
+	if opts.OpenBrowser {
+		if err := openBrowser(loginURL); err != nil {
+			opts.Logf("browser launch failed: %v", err)
+		}
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, opts.Timeout)
+	defer cancel()
+	lines := scanLines(waitCtx, in)
+	for {
+		fmt.Fprint(out, "callback URL: ")
+		var line string
+		var ok bool
+		select {
+		case line, ok = <-lines:
+			if !ok {
+				if waitCtx.Err() != nil {
+					return nil, manualWaitError(waitCtx.Err())
+				}
+				return nil, errors.New("input closed before a callback URL was provided")
+			}
+		case <-waitCtx.Done():
+			return nil, manualWaitError(waitCtx.Err())
+		}
+
+		q, err := parseCallbackURL(line)
+		if err != nil {
+			fmt.Fprintf(out, "invalid callback URL: %v\n", err)
+			continue
+		}
+		if q.Get("nonce") != "" {
+			authURL, err := f.processDiscovery(waitCtx, q)
+			if err != nil {
+				fmt.Fprintf(out, "discovery failed: %v\n", err)
+				continue
+			}
+			fmt.Fprintf(out, "Open this URL to continue signing in:\n%s\n", authURL)
+			fmt.Fprintln(out, "After the browser redirects, paste the next callback URL.")
+			continue
+		}
+		if q.Get("code") == "" && q.Get("error") == "" {
+			fmt.Fprintln(out, "callback URL has no code/error parameters; paste the URL from the browser address bar")
+			continue
+		}
+		acct, err := f.completeLogin(waitCtx, q)
+		if err != nil {
+			fmt.Fprintf(out, "login failed: %v\n", err)
+			continue
+		}
+		fmt.Fprintf(out, "Login complete: %s (account %d)\n", accountLabel(acct), acct.ID)
+		return acct, nil
+	}
+}
+
+func manualWaitError(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("timed out waiting for callback URL")
+	}
+	return err
+}
+
+func scanLines(ctx context.Context, r io.Reader) <-chan string {
+	ch := make(chan string)
+	go func() {
+		defer close(ch)
+		scanner := bufio.NewScanner(r)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1<<20)
+		for scanner.Scan() {
+			select {
+			case ch <- scanner.Text():
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return ch
+}
+
+// parseCallbackURL accepts a full callback URL, a host/path URL, a bare query
+// string, or the query parameters without '?'.
+func parseCallbackURL(raw string) (url.Values, error) {
+	s := strings.TrimSpace(raw)
+	s = strings.Trim(s, `"'<>`)
+	s = strings.ReplaceAll(s, "&amp;", "&")
+	if s == "" {
+		return nil, errors.New("empty input")
+	}
+	if strings.HasPrefix(s, "?") {
+		return url.ParseQuery(strings.TrimPrefix(s, "?"))
+	}
+	if !strings.Contains(s, "://") {
+		switch {
+		case strings.HasPrefix(s, "/"):
+			s = "http://localhost" + s
+		case strings.Contains(s, "/"):
+			s = "http://" + s
+		case strings.Contains(s, "="):
+			s = "http://localhost/?" + s
+		default:
+			return nil, errors.New("expected a callback URL or query string")
+		}
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return nil, err
+	}
+	if u.RawQuery == "" {
+		return nil, errors.New("callback URL has no query parameters")
+	}
+	return u.Query(), nil
 }
 
 func (f *loginFlow) finish(acct *store.Account, err error) {
@@ -179,15 +333,42 @@ func (f *loginFlow) handle(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *loginFlow) handleDiscovery(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	gotNonce := q.Get("nonce")
-	if gotNonce == "" || subtle.ConstantTimeCompare([]byte(gotNonce), []byte(f.nonce)) != 1 {
-		f.failPage(w, http.StatusBadRequest, "discovery nonce mismatch")
+	location, err := f.processDiscovery(r.Context(), r.URL.Query())
+	if err != nil {
+		f.failPage(w, statusOf(err), err.Error())
 		return
 	}
+	http.Redirect(w, r, location, http.StatusFound)
+}
+
+type stepError struct {
+	status  int
+	message string
+}
+
+func (e *stepError) Error() string { return e.message }
+
+func stepErrorf(status int, format string, args ...any) error {
+	return &stepError{status: status, message: fmt.Sprintf(format, args...)}
+}
+
+func statusOf(err error) int {
+	var se *stepError
+	if errors.As(err, &se) {
+		return se.status
+	}
+	return http.StatusInternalServerError
+}
+
+// processDiscovery validates the browser discovery callback and returns the
+// upstream authorize URL the user must open next.
+func (f *loginFlow) processDiscovery(ctx context.Context, q url.Values) (string, error) {
+	gotNonce := q.Get("nonce")
+	if gotNonce == "" || subtle.ConstantTimeCompare([]byte(gotNonce), []byte(f.nonce)) != 1 {
+		return "", stepErrorf(http.StatusBadRequest, "discovery nonce mismatch")
+	}
 	if v := q.Get("error"); v != "" {
-		f.failPage(w, http.StatusBadRequest, "login failed: "+v+" "+q.Get("error_description"))
-		return
+		return "", stepErrorf(http.StatusBadRequest, "login failed: %s %s", v, q.Get("error_description"))
 	}
 
 	if isEnterpriseDiscovery(f.provider) {
@@ -201,8 +382,7 @@ func (f *loginFlow) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 			Region:        firstQuery(q, "region"),
 		}
 		if f.discovery.AuthEndpoint == "" || f.discovery.TokenEndpoint == "" {
-			f.failPage(w, http.StatusBadRequest, "discovery response is missing authEndpoint/tokenEndpoint")
-			return
+			return "", stepErrorf(http.StatusBadRequest, "discovery response is missing authEndpoint/tokenEndpoint")
 		}
 		f.clientID = f.discovery.ClientID
 		f.secret = f.discovery.ClientSecret
@@ -219,8 +399,7 @@ func (f *loginFlow) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 			"access_type":           {"offline"},
 			"prompt":                {"consent"},
 		}
-		http.Redirect(w, r, appendQuery(f.discovery.AuthEndpoint, params), http.StatusFound)
-		return
+		return appendQuery(f.discovery.AuthEndpoint, params), nil
 	}
 
 	f.discovery = discovery{
@@ -229,8 +408,7 @@ func (f *loginFlow) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		IDCRegion: firstQuery(q, "idcRegion", "idc_region"),
 	}
 	if f.discovery.IssuerURL == "" {
-		f.failPage(w, http.StatusBadRequest, "discovery callback did not provide issuerUrl")
-		return
+		return "", stepErrorf(http.StatusBadRequest, "discovery callback did not provide issuerUrl")
 	}
 	idcRegion := f.discovery.IDCRegion
 	if idcRegion == "" {
@@ -242,16 +420,14 @@ func (f *loginFlow) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 	f.discovery.IDCRegion = idcRegion
 	f.discovery.Region = f.region
 
-	client, err := f.registerIDCClient(r.Context(), idcRegion)
+	client, err := f.registerIDCClient(ctx, idcRegion)
 	if err != nil {
-		f.failPage(w, http.StatusBadGateway, "client registration failed: "+err.Error())
-		return
+		return "", stepErrorf(http.StatusBadGateway, "client registration failed: %v", err)
 	}
 	f.clientID = client.id
 	f.secret = client.secret
 	if f.clientID == "" {
-		f.failPage(w, http.StatusBadGateway, "client registration returned no clientId")
-		return
+		return "", stepErrorf(http.StatusBadGateway, "client registration returned no clientId")
 	}
 	f.opts.Logf("discovery: tenant=%s idc_region=%s", emptyAs(f.discovery.TenantURL, "-"), idcRegion)
 
@@ -264,7 +440,7 @@ func (f *loginFlow) handleDiscovery(w http.ResponseWriter, r *http.Request) {
 		"code_challenge":        {f.challenge},
 		"code_challenge_method": {"S256"},
 	}
-	http.Redirect(w, r, appendQuery(f.oidcEndpoint(idcRegion)+"/authorize", params), http.StatusFound)
+	return appendQuery(f.oidcEndpoint(idcRegion)+"/authorize", params), nil
 }
 
 type clientCredentials struct {
@@ -299,31 +475,38 @@ func (f *loginFlow) registerIDCClient(ctx context.Context, idcRegion string) (cl
 }
 
 func (f *loginFlow) handleCode(w http.ResponseWriter, r *http.Request) {
-	q := r.URL.Query()
-	if v := q.Get("error"); v != "" {
-		f.failPage(w, http.StatusBadRequest, "login failed: "+v+" "+q.Get("error_description"))
+	a, err := f.completeLogin(r.Context(), r.URL.Query())
+	if err != nil {
+		f.failPage(w, statusOf(err), err.Error())
 		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = io.WriteString(w, successHTML(accountLabel(a)))
+	f.finish(a, nil)
+}
+
+// completeLogin exchanges the OAuth code, fetches user info and stores the
+// account. It is shared by the localhost callback server and manual mode.
+func (f *loginFlow) completeLogin(ctx context.Context, q url.Values) (*store.Account, error) {
+	if v := q.Get("error"); v != "" {
+		return nil, stepErrorf(http.StatusBadRequest, "login failed: %s %s", v, q.Get("error_description"))
 	}
 	gotState := q.Get("state")
 	if gotState == "" || subtle.ConstantTimeCompare([]byte(gotState), []byte(f.state)) != 1 {
-		f.failPage(w, http.StatusBadRequest, "OAuth state mismatch")
-		return
+		return nil, stepErrorf(http.StatusBadRequest, "OAuth state mismatch")
 	}
 	code := q.Get("code")
 	if code == "" {
-		f.failPage(w, http.StatusBadRequest, "OAuth callback has no code")
-		return
+		return nil, stepErrorf(http.StatusBadRequest, "OAuth callback has no code")
 	}
 
-	t, err := f.exchangeCode(r.Context(), code)
+	t, err := f.exchangeCode(ctx, code)
 	if err != nil {
-		f.failPage(w, http.StatusBadGateway, "token exchange failed: "+err.Error())
-		return
+		return nil, stepErrorf(http.StatusBadGateway, "token exchange failed: %v", err)
 	}
-	info, err := fetchUserInfo(r.Context(), f.provider, f.stage, f.discovery, f.discovery.TenantURL, t.AccessToken)
+	info, err := fetchUserInfo(ctx, f.provider, f.stage, f.discovery, f.discovery.TenantURL, t.AccessToken)
 	if err != nil {
-		f.failPage(w, http.StatusBadGateway, "user info failed: "+err.Error())
-		return
+		return nil, stepErrorf(http.StatusBadGateway, "user info failed: %v", err)
 	}
 
 	region := f.discovery.Region
@@ -347,19 +530,27 @@ func (f *loginFlow) handleCode(w http.ResponseWriter, r *http.Request) {
 		a.TokenEndpoint = f.oidcEndpoint(a.IDCRegion) + "/token"
 	}
 	if err := applySession(a, t, info); err != nil {
-		f.failPage(w, http.StatusBadGateway, err.Error())
-		return
+		return nil, stepErrorf(http.StatusBadGateway, "%v", err)
 	}
-	if err := f.store.Save(r.Context(), a); err != nil {
-		f.failPage(w, http.StatusInternalServerError, "save account: "+err.Error())
-		return
+	if err := f.store.Save(ctx, a); err != nil {
+		return nil, stepErrorf(http.StatusInternalServerError, "save account: %v", err)
 	}
 
 	f.opts.Logf("LOGIN_OK %s account_id=%d", info.Display(), a.ID)
 	f.opts.Logf("SESSION_SAVED account=%d ws_host=%s expires=%s", a.ID, a.WSHost, formatEpoch(a.ExpiresAt))
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_, _ = io.WriteString(w, successHTML(info.Display()))
-	f.finish(a, nil)
+	return a, nil
+}
+
+func accountLabel(a *store.Account) string {
+	if a == nil {
+		return ""
+	}
+	for _, v := range []string{a.Email, a.DisplayName, a.AccountName} {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 func (f *loginFlow) exchangeCode(ctx context.Context, code string) (tokens, error) {
