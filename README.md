@@ -365,3 +365,19 @@ quickwork-openai/
 ## Acknowledgements
 
 Thanks to the [LINUX DO](https://linux.do) community for its support.
+
+
+## macOS 图形界面
+
+本仓库提供原生 SwiftUI 管理应用 QuickProxy.app，支持 Apple Silicon 与 Intel Mac。
+
+- [下载 macOS 预览版（DMG / ZIP）](https://github.com/Elm-Forest/aws-quickwork-2api/releases/tag/macos-preview)
+- [查看 GitHub Actions 构建结果](https://github.com/Elm-Forest/aws-quickwork-2api/actions/workflows/release.yml)
+
+图形界面可启动与停止代理、使用浏览器添加账号、刷新令牌、移除账号、修改常用配置并查看进程日志。菜单栏支持服务启停和打开管理窗口。
+
+首次打开应用后，点击“添加账号”完成浏览器登录，再点击“启动代理”。默认 API 地址为 http://127.0.0.1:8080/v1。
+
+配置与账号数据库位于用户目录 ~/Library/Application Support/QuickProxy/，安装新版本不会覆盖该目录。
+
+安装限制、签名状态及高级配置说明集中放在 [macOS 构建与限制说明](docs/MACOS_NOTES.md)。
