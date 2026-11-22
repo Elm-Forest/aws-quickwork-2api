@@ -119,6 +119,13 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	bridgePrompt := buildToolBridgePrompt(&req, choiceMode, choiceName, parallelTools)
 	bridgeActive := bridgePrompt != ""
 	systemPromptText := systemPrompt(req.Messages, bridgePrompt)
+	// QuickWork has no per-turn system prompt channel, so the caller's
+	// instructions are attached at the head of the user turn by the upstream
+	// layer, while the transcript stays a separate field for attachment upload.
+	instructions := ""
+	if bridgeActive || hasCallerInstructions(req.Messages) {
+		instructions = systemPromptText
+	}
 
 	conv := s.sessions.acquire(conversationKey(r, &req, systemPromptText))
 	defer s.sessions.release(conv)
@@ -145,7 +152,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		Model:         model,
 		ThreadID:      threadID,
 		Title:         titleFor(lastUserText(req.Messages)),
-		SystemPrompt:  systemPromptText,
+		SystemPrompt:  instructions,
 		ChatAgentID:   s.cfg.ChatAgentID,
 		CreateSession: true,
 		DeleteSession: !s.cfg.SessionReuse && !s.cfg.KeepSessions,
@@ -461,7 +468,10 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	var outTools []ToolCall
 	finish := "stop"
 	if bridgeActive {
-		outText, replies := parseClientToolCalls(bridgeBuffer.String(), allowedTools)
+		// Assign to the outer variables: a `:=` here would shadow outText and
+		// drop the buffered answer, streaming a stop with usage but no content.
+		var replies []ToolCallReply
+		outText, replies = parseClientToolCalls(bridgeBuffer.String(), allowedTools)
 		if len(replies) == 0 {
 			replies = nativeToolReplies(res.ToolCalls, allowedTools)
 		}

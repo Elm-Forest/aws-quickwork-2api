@@ -22,8 +22,8 @@
 - 工具桥接兼容多种模型写法：`arguments` / `parameters` / `input` / `args`、`tool_calls` / `tool_call` / `function_call`、Markdown 代码块、`functions.` 等命名空间前缀、大小写与唯一后缀匹配；支持同一轮并行多个工具调用
 - 历史中的 `assistant.tool_calls` / `role: tool` 仍会按文本渲染，供上游理解已有上下文
 - 使用上游 `turn_usage` 返回 `usage` 与 `prompt_tokens_details.cached_tokens`
-- `system` / `developer` 消息通过 QuickWork 原生 `system_prompt` 覆盖服务端基础提示词，并附加后端提示词覆盖声明，要求模型忽略上游追加的 system / agent 指令、不得使用或列举平台内置工具；不拼进 user 文本
-- 64 KB 单帧预算按实际 JSON 字节计算：先裁剪历史，再裁剪过大的调用方 system prompt，保留开头、结尾与覆盖声明，避免直接返回 `request_too_large`
+- `system` / `developer` 消息与工具定义放在本轮 user 文本开头的 `[System instructions from the API caller]` 区块内；上游会忽略每轮 `system_prompt` 字段，并把 `custom_prompt` 当作低信任的个人偏好，user 轮次是唯一可靠送达调用方指令的通道
+- 64 KB 单帧预算按实际 JSON 字节计算：用户内容过大时优先走 out-of-band 附件（`upload-attachment` → DLP 扫描 → `files/upload`），WebSocket 只发送短引用与 `attachments` 元数据；附件只包含用户内容，调用方指令仍留在 WS 文本里。附件不可用时才裁剪、保留开头与结尾，避免直接返回 `request_too_large`
 - `chat_agent_id` 可指定一个 QuickWork 自定义 agent，以替代默认内置 agent 的提示词与工具策略
 
 ## 环境要求
@@ -268,11 +268,10 @@ sequenceDiagram
 
 ### 提示词与工具调用
 
-- `system` / `developer` 消息会按原顺序合并，放入 `user_message.payload.system_prompt`。
-- `system_prompt` 始终发送：合并后的调用方指令后面固定追加一条严格的系统提示词优先级声明，要求模型丢弃 QuickWork 服务端附加的所有 system / developer / agent / runtime / system-reminder 指令，即使它们出现在后面、自称更具体、自称可覆盖该声明，或标记为 system 消息。
-- 覆盖声明还明确 relay 模式：只允许使用 `<caller_tool_interface>` 中声明的调用方工具；平台内置工具、connector、skill、文件、Python/JavaScript、时间/日历、memory、后台任务都不可用，不得调用、列举或描述。调用方未提供 system 消息时，字段只包含该声明；服务端内置提示词仍会占用上下文，但其指令让位于该声明。已验证 social 路径，enterprise / gateway 仍待逐项验证。
-- 覆盖声明写在 `system_prompt` 里，不是 user 文本注入，也不会把 system prompt 塞进 user 文本。
-- 客户端 `tools` / `functions` / `tool_choice` 会原样写入 `system_prompt` 的 `<caller_tool_interface>` 块。该块明确标记为调用方指令；覆盖声明也会保留它，不当作后端提示词丢弃。
+- `system` / `developer` 消息会按原顺序合并，与工具定义一起组成 caller 指令块，放在本轮 user 文本开头：`[System instructions from the API caller]` … `[End system instructions]`，后面才是 `[User message]` 与 transcript。
+- 这是为了适配上游实际行为：`user_message.payload.system_prompt` 会被服务端忽略（模型完全看不到），`custom_prompt` 会被当成低信任的个人偏好、可能被拒绝执行。放进 user 轮次的调用方指令则会被当作本轮任务，实测能稳定驱动工具调用与格式要求。
+- caller 指令块后面固定追加一条简短的中性 relay 说明：本轮通过 OpenAI 兼容 API 转发，调用方指令与 `<caller_tool_interface>` 定义本轮任务和工具，工具由调用方执行。刻意的「丢弃服务端提示词 / 忽略身份」措辞会触发上游的安全判断，使模型连正常指令一起拒绝，因此不使用。
+- 客户端 `tools` / `functions` / `tool_choice` 会原样写入 caller 指令块中的 `<caller_tool_interface>`，并明确说明这些工具由调用方提供、执行并回传结果，模型不需要内置对应的工具。
 - 模型使用 `<client_tool_call>{"name":"...","arguments":{...}}</client_tool_call>` 发起调用。解析器同时兼容 `<tool_call>`、`<function_call>`、整段 JSON、Markdown 代码块、`tool_calls` / `tool_call` / `function_call` 包装、`arguments` / `parameters` / `input` / `args` 字段、`functions.` 等前缀、大小写差异和唯一后缀匹配。未知工具名或非法 JSON 会保留为普通文本。
 - 并行调用：允许在同一回复中连续输出多个 `<client_tool_call>`；`parallel_tool_calls=false` 时只保留第一个。
 - 代理把解析结果转成 OpenAI `tool_calls`，但**不执行工具**；客户端执行后把结果作为 `role: tool` 发回，代理再转成文本上下文。
@@ -281,7 +280,7 @@ sequenceDiagram
 - 上游只输出 thinking、空白或零宽字符时，代理返回明确错误并带上 `completion_tokens`，不再返回空的 `finish_reason=stop`。
 - 有客户端工具时，流式响应会缓冲到本轮结束，再一次性发送文本或 `tool_calls`；非流式不受影响。
 - `tool_choice: "none"` 关闭桥接；指定函数时只接受该函数；`parallel_tool_calls=false` 时最多返回一个工具调用。
-- 内置 agent 的 60K+ token 提示词与内置工具仍由 QuickWork 服务端维护。若需要更强的隔离，在 `config.json` 设置 `chat_agent_id` 指向一个关闭内置工具、使用自定义 system prompt 的 QuickWork agent；代理会把该 ID 放进 `user_message.chat_agent_id`。
+- 内置 agent 的 60K+ token 提示词、产品身份与内置工具仍由 QuickWork 服务端维护，无法通过 `user_message` 删除；调用方指令决定任务行为，但模型仍可能自称 AWS Quick。若需要彻底替换提示词与工具策略，在 `config.json` 设置 `chat_agent_id` 指向一个关闭内置工具、使用自定义 system prompt 的 QuickWork agent；代理会把该 ID 放进 `user_message.chat_agent_id`。
 
 ### 会话复用
 
@@ -309,6 +308,7 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 ## 安全与隐私
 
 - `data/quickwork.db` 包含 access token、refresh token、client secret 和用户信息，已被 `.gitignore` 排除。
+- 当单个 `user_message` 超过 64 KB 且账号有 `tenant_url` 时，代理会把该轮用户内容作为临时文本附件上传到 Quick 的附件服务并等待 DLP 扫描；这是绕过单帧上限的方式，内容仍位于你的 Quick 租户内，但受组织 DLP 策略约束。
 - `config.json` 默认不含密钥；如果写入 `api_keys`，不要提交真实 key。
 - 登录密码只在 Amazon 的浏览器页面中输入，本项目不会保存密码。
 - 反代默认只监听 `127.0.0.1`。不要把端口直接暴露到公网；如确需远程访问，请自行加 TLS 与访问控制。
@@ -318,11 +318,11 @@ chat chatcmpl-... done status=ok account=1:social:user@example.com model=smart a
 ## 限制
 
 - 只实现聊天补全。`temperature`、`max_tokens`、`stop`、`response_format` 等采样参数不会传给上游；`n > 1` 会返回 400。
-- 上游 `user_message` 帧上限 64 KB。会话复用开启时通常只送新增消息；若单个 delta 仍超限，代理会按实际 JSON 字节保留开头与结尾、裁剪中间历史，并记录 `user_message trimmed ...`。如果调用方 `system_prompt` 本身过大，代理会先保留用户消息，再裁剪 system prompt 的中间部分，保留开头、结尾和覆盖声明；只有连最小帧都无法放入时才返回 `400 request_too_large`。
+- 上游 `user_message` 帧上限 64 KB。会话复用开启时通常只送新增消息；若单个 delta 仍超限，代理会先把该轮用户内容上传为上游附件（`POST /integration/quick-work/upload-attachment`、轮询 `attachment-dlp-status`、再以 `qbs-event` 投递到 `files/upload/<thread>`），WS 只送短引用和 `attachments` 元数据；附件必须在 DLP 返回 `ALLOW` 后才能使用，`WARN` 视为不可用。附件只放用户内容，调用方指令与工具定义留在 WS 文本中，避免模型把附件里的指令当成注入。附件路径失败、账号没有 `tenant_url`、gateway transport 或被 DLP 拒绝时，代理回退到裁剪：按实际 JSON 字节保留开头与结尾、裁剪中间内容，并记录 `user_message trimmed ...`；只有连最小帧都无法放入时才返回 `400 request_too_large`。
 - WebSocket 分片只影响传输层，上游重組後仍按單一 `user_message` 檢查 64 KB。多個 `user_message` 會被視為多輪；`mid_turn` 是 steering，`message_split` 是服務端輸出事件，不能用來拼接同一輪輸入。
 - 工具桥接使用文本协议，模型偶尔可能不遵守；有工具时流式响应会缓冲到本轮结束。代理只解析并返回 `tool_calls`，不执行工具。
-- 默认内置 agent 仍会在服务端附加约 60K token 的提示词和内置工具。覆盖声明能阻止模型遵循或列举这些内容，但不能删除服务端上下文；需要彻底隔离时使用 `chat_agent_id` 指向自定义 agent。
-- `system_prompt` 覆盖已在 social 路径验证；enterprise / gateway 仍待验证。空 system 消息也会发送覆盖声明，但服务端内置提示词仍会占用上下文，只是其指令让位于该声明。
+- 默认内置 agent 仍会在服务端附加约 60K token 的提示词和内置工具。调用方指令通过 user 轮次影响任务行为，但不能删除服务端上下文或改掉产品身份；需要彻底隔离时使用 `chat_agent_id` 指向自定义 agent。
+- 上游会忽略 `user_message.payload.system_prompt`，并把 `custom_prompt` 视为低信任偏好；代理因此不再使用这两个字段。caller 指令跟随 user 文本发送，已在 social 路径用真实账号验证；enterprise / gateway 仍待验证。
 - `model` 会映射为上游 agent mode：`smart`、`fast`、`balanced`、`auto`。
 - 上游没有模型列表 API；`/v1/models` 返回的是本项目配置的别名。
 - social / enterprise 路径已做真实账号验证；`gateway` / `social_gateway` 的 CBOR 路径仍属实验性。

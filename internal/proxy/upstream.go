@@ -199,7 +199,7 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	}
 
 	payload := map[string]any{
-		"text":               in.Prompt,
+		"text":               relayPrompt(in.SystemPrompt, in.Prompt),
 		"send_origin":        "programmatic",
 		"had_physical_input": false,
 		"surfaceType":        sess.Surface,
@@ -222,15 +222,46 @@ func (u *Upstream) Chat(ctx context.Context, sess *Session, in ChatInput, onEven
 	if id := strings.TrimSpace(in.ChatAgentID); id != "" {
 		payload["chat_agent_id"] = id
 	}
-	// system_prompt is the native per-turn override. It always carries the
-	// caller's system/developer instructions plus the backend-prompt override
-	// notice, so instructions the service attaches to the turn lose precedence.
-	if strings.TrimSpace(in.SystemPrompt) != "" {
-		payload["system_prompt"] = in.SystemPrompt
-	}
+	// The service ignores a per-turn "system_prompt" field and treats
+	// "custom_prompt" as low-trust saved preferences, so caller instructions are
+	// carried at the head of the user_message text instead (see relayPrompt).
 	if u.cfg.ThinkingEffort != "" {
 		payload["thinking_effort"] = u.cfg.ThinkingEffort
 	}
+
+	// A single user_message is capped at 64 KB. When the caller's prompt is
+	// what pushes the frame over the limit, upload it out of band and send a
+	// short reference instead; the file bytes never enter the WebSocket frame.
+	// The normal trimming path below remains the fallback when the tenant
+	// attachment service is unavailable or blocked. Gateway transports use a
+	// different upload route and keep the trimming path for now.
+	if !isGatewayProvider(sess.Provider) && strings.TrimSpace(sess.TenantURL) != "" {
+		if n, err := userMessageBytes(payload); err == nil && n > maxUserMessageBytes {
+			name := attachmentPromptName(messageID)
+			if shouldAttachPrompt(len(in.Prompt)) {
+				att, attErr := uploadPromptAttachment(ctx, sess, threadID, name, []byte(in.Prompt))
+				if attErr != nil {
+					log.Printf("user_message attachment unavailable thread=%s bytes=%d: %v", threadID, len(in.Prompt), attErr)
+				} else if att.Path != "" {
+					payload["text"] = relayPrompt(in.SystemPrompt, attachmentShortText(att.Name))
+					meta := map[string]any{
+						"type":     "file",
+						"name":     att.Name,
+						"size":     att.Size,
+						"mimeType": attachmentMimeType,
+						"path":     att.Path,
+					}
+					if att.ID != "" {
+						meta["attachmentId"] = att.ID
+					}
+					payload["attachments"] = []map[string]any{meta}
+					log.Printf("user_message attachment thread=%s bytes=%d name=%s id=%s path=%s",
+						threadID, att.Size, att.Name, att.ID, att.Path)
+				}
+			}
+		}
+	}
+
 	if err := fitUserMessage(payload); err != nil {
 		return ChatResult{}, err
 	}
@@ -758,10 +789,9 @@ func truncateText(s string, max int) string {
 // Upstream checks the reassembled user_message JSON, so WebSocket
 // fragmentation or multiple user_message frames cannot carry one oversized
 // turn: extra frames would become separate turns. Trim within the single frame
-// instead. Prompt text is trimmed first; if a caller's system prompt alone
-// cannot fit, it is trimmed too, preserving the leading instructions and the
-// trailing authority notice. Trimming is byte-based because the upstream limit
-// is bytes, not runes.
+// instead. The middle of the prompt text is removed, preserving its beginning
+// and its end (where the tool interface and the user request sit). Trimming is
+// byte-based because the upstream limit is bytes, not runes.
 func fitUserMessage(payload map[string]any) error {
 	wrap := func() ([]byte, error) {
 		return json.Marshal(map[string]any{"type": "user_message", "payload": payload})
@@ -775,10 +805,8 @@ func fitUserMessage(payload map[string]any) error {
 	}
 	original := len(body)
 	text, _ := payload["text"].(string)
-	system, _ := payload["system_prompt"].(string)
 
-	// 1. History/prompt text is the normal overflow source. Keep a small user
-	// prompt intact and trim the system prompt instead.
+	// 1. The prompt text is the normal overflow source; trim its middle first.
 	if len(text) > 4096 {
 		payload["text"] = shrinkToLimit(text, func(s string) ([]byte, error) {
 			payload["text"] = s
@@ -789,18 +817,7 @@ func fitUserMessage(payload map[string]any) error {
 		}
 	}
 
-	// 2. A large caller system prompt is also bounded by the same frame.
-	if len(body) > maxUserMessageBytes && strings.TrimSpace(system) != "" {
-		payload["system_prompt"] = shrinkToLimit(system, func(s string) ([]byte, error) {
-			payload["system_prompt"] = s
-			return wrap()
-		}, systemTrimMarker)
-		if body, err = wrap(); err != nil {
-			return err
-		}
-	}
-
-	// 3. If metadata plus both fields still overflow, drop text to the marker.
+	// 2. If metadata plus text still overflow, shrink text down to the marker.
 	if len(body) > maxUserMessageBytes && text != "" {
 		payload["text"] = shrinkToLimit(text, func(s string) ([]byte, error) {
 			payload["text"] = s
@@ -812,16 +829,13 @@ func fitUserMessage(payload map[string]any) error {
 	}
 
 	if len(body) > maxUserMessageBytes {
-		return fmt.Errorf("%w: %d bytes after trimming prompt and system prompt", ErrUserMessageTooLarge, len(body))
+		return fmt.Errorf("%w: %d bytes after trimming the prompt", ErrUserMessageTooLarge, len(body))
 	}
 	log.Printf("user_message trimmed %d -> %d bytes (limit %d)", original, len(body), maxUserMessageBytes)
 	return nil
 }
 
-const (
-	textTrimMarker   = "\n\n[earlier conversation trimmed to fit the upstream 64 KB frame limit]\n\n"
-	systemTrimMarker = "\n\n[caller system prompt trimmed to fit the upstream 64 KB frame limit]\n\n"
-)
+const textTrimMarker = "\n\n[earlier conversation trimmed to fit the upstream 64 KB frame limit]\n\n"
 
 // shrinkToLimit removes bytes from the middle of s until wrap(s) fits. It
 // preserves the beginning and the end, so recent context and trailing
