@@ -72,4 +72,16 @@
 - 观测记录为历史事实，无法保证上游下次使用相同模型。`/v1/models` 把具体模型 ID 映射到上次观测对应的 agent mode；不具备底层模型强制选择能力。
 - 记录路径：`~/Library/Application Support/QuickProxy/data/observed-models.json`。文件不包含 API Key 或会话内容。
 - CC Switch 获取模型需使用 `http://127.0.0.1:<监听端口>/v1` 和正确的本地 API Key。
-- 当前 Go 服务对聊天请求使用 OpenAI Chat Completions 协议；直接作为 Anthropic Messages API 服务接入 Claude Desktop 时仍需协议转换层。
+- 新版 Go 服务同时提供 OpenAI Chat Completions 与 Anthropic Messages 兼容端点。
+
+
+## Anthropic 兼容能力与限制
+
+- `POST /v1/messages` 支持普通回复与 SSE 流式输出，`/messages` 为另一种路径。
+- 支持标准文本块、`tool_use`/`tool_result` 转换与工具定义、`tool_choice`。工具调用复用 QuickProxy 原有的提示词工具桥接，行为与 Anthropic 上游原生 tool calling 不完全相同。
+- `GET /v1/models` 携带 `anthropic-version` 时返回 Anthropic 格式模型列表，其他客户端仍接收 OpenAI 格式。另支持 `GET /v1/models/{id}`。
+- API Key 可通过 `x-api-key` 或 `Authorization: Bearer` 请求头传入。
+- Claude 名称映射：Haiku → `fast`、Sonnet → `balanced`、Opus → `smart`。指定底层模型 ID 时只是复用历史观测档位，上游可以动态变更实际模型。
+- `count_tokens` 根据请求结构近似计算，带有 `estimated: true` 字段，不能当作准确模型分词结果。
+- 尚未实现图像输入、原生 PDF 文档块、文件上传端点、Batch API、精确采样、思考签名透传、官方 Beta 扩展协议和完整 Anthropic API。API 调用中的 `max_tokens`、`temperature` 和 `stop_sequences` 不会强制控制 Quick 的真实输出。
+- 工具调用由上游模型文本生成的标记经桥接实现，可能受模型提示词遵循情况影响；复杂工具链需单独实测。

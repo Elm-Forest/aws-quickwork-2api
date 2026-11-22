@@ -135,6 +135,8 @@ func TestAnthropicEndpointValidationAndModels(t *testing.T) {
         "claude-haiku-5-5":"fast",
         "claude-sonnet-4-5":"balanced",
         "claude-opus-5-5":"smart",
+        "claude-3-5-haiku-20241022":"fast",
+        "claude-3-7-sonnet-latest":"balanced",
     } {
         if actual:=srv.mapModel(model);actual!=want {t.Errorf("routing %s: got %s want %s",model,actual,want)}
     }

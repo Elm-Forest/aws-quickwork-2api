@@ -589,13 +589,15 @@ func (s *Server) mapModel(model string) string {
 	}
 	// Anthropic clients use named Claude model IDs. These are mapped to
 	// Quick's supported agent modes; the upstream chooses the actual model.
-	switch {
-	case strings.Contains(m, "claude-haiku"):
-		return "fast"
-	case strings.Contains(m, "claude-sonnet"):
-		return "balanced"
-	case strings.Contains(m, "claude-opus"), strings.Contains(m, "claude-fable"):
-		return "smart"
+	if strings.Contains(m, "claude") {
+		switch {
+		case strings.Contains(m, "haiku"):
+			return "fast"
+		case strings.Contains(m, "sonnet"):
+			return "balanced"
+		case strings.Contains(m, "opus"), strings.Contains(m, "fable"):
+			return "smart"
+		}
 	}
 	switch m {
 	case "":

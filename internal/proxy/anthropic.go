@@ -170,17 +170,7 @@ func fromAnthropic(request anthropicRequest) (ChatRequest, error) {
                     // Signed thinking traces are opaque and cannot be replayed
                     // as upstream model instructions.
                 case "image":
-                    source, _ := block["source"].(map[string]any)
-                    media, _ := source["media_type"].(string)
-                    data, _ := source["data"].(string)
-                    if source["type"] == "base64" && strings.HasPrefix(media, "image/") && data != "" {
-                        texts = append(texts, map[string]any{
-                            "type": "image_url",
-                            "image_url": map[string]any{"url": "data:" + media + ";base64," + data},
-                        })
-                    } else {
-                        return out, fmt.Errorf("messages[%d].content[%d]: unsupported image source", i, j)
-                    }
+                    return out, fmt.Errorf("messages[%d].content[%d]: image input is not supported by the Quick proxy", i, j)
                 case "tool_use":
                     if role != "assistant" { return out, fmt.Errorf("tool_use requires assistant role") }
                     name, _ := block["name"].(string)
@@ -272,6 +262,18 @@ func anthropicText(raw json.RawMessage) (string, error) {
 
 func anthropicResultText(content any) string {
     if content == nil { return "" }
+    if blocks, ok := content.([]any); ok {
+        var parts []string
+        for _, item := range blocks {
+            block, ok := item.(map[string]any)
+            if ok && block["type"] == "text" {
+                if text, ok := block["text"].(string); ok { parts = append(parts, text) }
+            } else {
+                parts = append(parts, "[unsupported non-text tool result]")
+            }
+        }
+        return strings.Join(parts, "\n")
+    }
     return contentText(content)
 }
 
@@ -431,7 +433,7 @@ func (s *anthropicSSE) complete() {
     s.closeActive()
     s.event("message_delta",map[string]any{"type":"message_delta",
         "delta":map[string]any{"stop_reason":s.stop,"stop_sequence":nil},
-        "usage":map[string]any{"output_tokens":s.outputTokens}})
+        "usage":map[string]any{"input_tokens":s.inputTokens,"output_tokens":s.outputTokens}})
     s.event("message_stop",map[string]any{"type":"message_stop"})
 }
 
