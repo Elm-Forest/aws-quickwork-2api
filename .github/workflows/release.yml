@@ -72,7 +72,7 @@ jobs:
           for ARCH in arm64 x86_64; do
             xcrun swiftc \
               -target "$ARCH-apple-macos13.0" \
-              -sdk "$SDK" -O \
+              -sdk "$SDK" -parse-as-library -O \
               -framework SwiftUI -framework AppKit -framework Foundation \
               -o "build/gui-$ARCH" \
               macos/QuickProxyApp.swift
