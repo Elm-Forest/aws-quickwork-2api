@@ -39,14 +39,19 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/healthz", s.handleHealth)
 	mux.HandleFunc("/v1/models", s.handleModels)
+	mux.HandleFunc("/v1/models/", s.handleAnthropicModel)
 	mux.HandleFunc("/v1/chat/completions", s.handleChat)
+	mux.HandleFunc("/v1/messages", s.handleAnthropicMessages)
+	mux.HandleFunc("/messages", s.handleAnthropicMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", s.handleAnthropicCountTokens)
+	mux.HandleFunc("/messages/count_tokens", s.handleAnthropicCountTokens)
 	return s.withCORS(mux)
 }
 
 func (s *Server) withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, X-Thread-Id, X-Conversation-Id")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, X-Api-Key, Anthropic-Version, Anthropic-Beta, X-Thread-Id, X-Conversation-Id")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -70,6 +75,10 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	data := s.models.listForOpenAI(s.cfg.Models)
+	if r.Header.Get("Anthropic-Version") != "" {
+		s.writeAnthropicModels(w, data)
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
@@ -577,6 +586,20 @@ func (s *Server) mapModel(model string) string {
 	switch m {
 	case "smart", "fast", "balanced", "advanced", "auto":
 		return m
+	}
+	// Anthropic clients use named Claude model IDs. These are mapped to
+	// Quick's supported agent modes; the upstream chooses the actual model.
+	if strings.Contains(m, "claude") {
+		switch {
+		case strings.Contains(m, "haiku"):
+			return "fast"
+		case strings.Contains(m, "sonnet"):
+			return "balanced"
+		case strings.Contains(m, "opus"), strings.Contains(m, "fable"):
+			return "smart"
+		}
+	}
+	switch m {
 	case "":
 		return s.cfg.DefaultModel
 	default:

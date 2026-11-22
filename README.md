@@ -395,3 +395,30 @@ Amazon Quick 请求使用 agent mode（如 smart、fast、balanced），上游�
 - 即使该账号的上游 `turn_usage` 不返回模型标识，原有档位模型列表和聊天功能仍正常工作。
 
 该功能参考 [magpie-aws-quick](https://github.com/httpdone/magpie-aws-quick) 对 `turn_usage` 的处理思路；该项目同样以 agent mode 调度。见其 `lib/handler.mjs` 与 `lib/translate.mjs`。
+
+
+## Anthropic Messages API
+
+QuickProxy 同时提供 OpenAI Chat Completions 与 Anthropic Messages 格式。两种协议共用本机 API Key、账号轮询、会话复用与上游 WebSocket。
+
+| 接口 | 用途 |
+|---|---|
+| `POST /v1/chat/completions` | OpenAI Chat Completions |
+| `POST /v1/messages`（另有 `/messages`）| Anthropic Messages，支持非流式和 SSE |
+| `POST /v1/messages/count_tokens` | 近似 token 数（`estimated: true`） |
+| `GET /v1/models` | 同时兼容 OpenAI 和 Anthropic 列表 |
+| `GET /v1/models/{id}` | Anthropic 单个模型元数据 |
+
+使用本地配置的监听地址与 Key。示例：
+
+```bash
+curl http://127.0.0.1:8899/v1/messages \
+  -H "x-api-key: $QUICKPROXY_KEY" \
+  -H "anthropic-version: 2023-06-01" \
+  -H "content-type: application/json" \
+  -d '{"model":"smart","max_tokens":128,"messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+CC Switch 的 Claude/Claude Desktop 供应商可使用 Anthropic 格式。根据客户端 URL 拼接方式，根地址通常填写 `http://127.0.0.1:8899`；如客户端仅追加 `/messages`，也支持 `http://127.0.0.1:8899/v1`。Key 使用 QuickProxy 应用“API 密钥”页面中保存的本机密钥。
+
+模型名称经由 Quick 的 `agent_mode` 调度：Haiku → fast、Sonnet → balanced、Opus → smart。实际底层模型依然由 Quick 服务端决定。Anthropic 格式支持文字、工具声明、工具结果与流式 SSE；限制参见 `docs/MACOS_NOTES.md`。
