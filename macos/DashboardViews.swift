@@ -255,6 +255,49 @@ private struct OverviewPage: View {
                 }
             }
 
+            Panel {
+                VStack(alignment: .leading, spacing: 13) {
+                    HStack {
+                        PanelTitle(
+                            "已观测底层模型",
+                            subtitle: "来自上游 turn_usage；选择时仍按对应档位路由"
+                        )
+                        Spacer(minLength: 12)
+                        Button {
+                            manager.reloadObservedModels()
+                        } label: {
+                            Label("刷新", systemImage: "arrow.clockwise")
+                        }
+                    }
+                    Divider()
+                    if manager.observedModels.isEmpty {
+                        Text("尚无模型观测记录。成功调用模型并刷新后，将显示底层模型标识。")
+                            .font(.system(size: 12))
+                            .foregroundStyle(Theme.muted)
+                            .padding(.vertical, 8)
+                    } else {
+                        ForEach(manager.observedModels) { item in
+                            HStack(alignment: .top, spacing: 12) {
+                                Text(item.id)
+                                    .font(.system(size: 12, design: .monospaced))
+                                    .foregroundStyle(Theme.ink)
+                                    .textSelection(.enabled)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Spacer(minLength: 8)
+                                Text(item.agentMode)
+                                    .font(.system(size: 11, weight: .medium))
+                                    .foregroundStyle(Theme.accent)
+                                    .padding(.horizontal, 9)
+                                    .padding(.vertical, 4)
+                                    .background(Theme.accentBackground)
+                                    .clipShape(Capsule())
+                            }
+                            .padding(.vertical, 4)
+                        }
+                    }
+                }
+            }
+
             if manager.accounts.isEmpty {
                 HStack(spacing: 10) {
                     Image(systemName: "info.circle")

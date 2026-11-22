@@ -50,6 +50,18 @@ struct AccountEntry: Identifiable {
     var isReady: Bool { status == "ready" }
 }
 
+struct ObservedModelEntry: Decodable, Identifiable {
+    let id: String
+    let agentMode: String
+    let lastSeen: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case agentMode = "agent_mode"
+        case lastSeen = "last_seen"
+    }
+}
+
 final class ProxyManager: ObservableObject {
     @Published private(set) var isRunning = false
     @Published private(set) var isWorking = false
@@ -61,6 +73,7 @@ final class ProxyManager: ObservableObject {
     @Published private(set) var sessionReuse = true
     @Published private(set) var apiKeys: [String] = []
     @Published private(set) var modelOptions: [String] = ["smart", "fast", "balanced", "auto"]
+    @Published private(set) var observedModels: [ObservedModelEntry] = []
     @Published var lastError: String?
     @Published var notice: String?
 
@@ -97,7 +110,19 @@ final class ProxyManager: ObservableObject {
         refreshAccounts()
     }
 
+    func reloadObservedModels() {
+        let path = supportURL.appendingPathComponent("data/observed-models.json")
+        guard let data = try? Data(contentsOf: path),
+              let models = try? JSONDecoder().decode([ObservedModelEntry].self, from: data)
+        else {
+            observedModels = []
+            return
+        }
+        observedModels = models
+    }
+
     func reloadConfig() {
+        reloadObservedModels()
         guard let data = try? Data(contentsOf: configURL),
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else { return }
