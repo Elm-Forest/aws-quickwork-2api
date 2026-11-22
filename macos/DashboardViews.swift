@@ -212,7 +212,7 @@ private struct OverviewPage: View {
             Panel {
                 VStack(alignment: .leading, spacing: 16) {
                     HStack {
-                        PanelTitle("API 接入", subtitle: "兼容 OpenAI Chat Completions")
+                        PanelTitle("API 接入", subtitle: "兼容 OpenAI Chat Completions 与 Anthropic Messages")
                         Spacer()
                         StatusTag(text: manager.apiKeys.isEmpty ? "未启用鉴权" : "已启用鉴权", active: !manager.apiKeys.isEmpty)
                     }
@@ -249,6 +249,8 @@ private struct OverviewPage: View {
                         Text("/v1/chat/completions")
                         Text("·")
                         Text("/v1/models")
+                        Text("·")
+                        Text("/v1/messages")
                     }
                     .font(.system(size: 12, design: .monospaced))
                     .foregroundStyle(Theme.muted)
