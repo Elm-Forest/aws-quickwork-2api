@@ -59,6 +59,8 @@ final class ProxyManager: ObservableObject {
     @Published private(set) var endpoint = "http://127.0.0.1:8080/v1"
     @Published private(set) var defaultModel = "smart"
     @Published private(set) var sessionReuse = true
+    @Published private(set) var apiKeys: [String] = []
+    @Published private(set) var modelOptions: [String] = ["smart", "fast", "balanced", "auto"]
     @Published var lastError: String?
     @Published var notice: String?
 
@@ -66,6 +68,7 @@ final class ProxyManager: ObservableObject {
     private var serverProcess: Process?
     private var serverPipe: Pipe?
     private var stopRequested = false
+    private var restartPending = false
 
     let supportURL: URL = FileManager.default.urls(
         for: .applicationSupportDirectory,
@@ -103,42 +106,99 @@ final class ProxyManager: ObservableObject {
         endpoint = "http://\(address)/v1"
         defaultModel = json["default_model"] as? String ?? "smart"
         sessionReuse = json["session_reuse"] as? Bool ?? true
+        apiKeys = json["api_keys"] as? [String] ?? []
+        let models = json["models"] as? [String] ?? []
+        modelOptions = models.isEmpty ? ["smart", "fast", "balanced", "auto"] : models
     }
 
-    func saveSettings(address: String, model: String, reuse: Bool) -> Bool {
-        let trimmed = address.trimmingCharacters(in: .whitespacesAndNewlines)
-        let parts = trimmed.split(separator: ":", omittingEmptySubsequences: false)
-        guard parts.count == 2,
-              ["127.0.0.1", "localhost"].contains(String(parts[0])),
-              let port = Int(parts[1]), (1...65535).contains(port)
-        else {
-            lastError = "监听地址需要使用 127.0.0.1:端口 或 localhost:端口。"
-            return false
-        }
+    var listenHost: String {
+        let hostAndPort = endpoint
+            .replacingOccurrences(of: "http://", with: "")
+            .replacingOccurrences(of: "/v1", with: "")
+        return String(hostAndPort.split(separator: ":", omittingEmptySubsequences: false).first ?? "127.0.0.1")
+    }
 
+    var listenPort: String {
+        let hostAndPort = endpoint
+            .replacingOccurrences(of: "http://", with: "")
+            .replacingOccurrences(of: "/v1", with: "")
+        let fields = hostAndPort.split(separator: ":", omittingEmptySubsequences: false)
+        return fields.count == 2 ? String(fields[1]) : "8080"
+    }
+
+    private func persistConfig(_ change: (inout [String: Any]) -> Void) -> Bool {
         do {
-            guard let data = try? Data(contentsOf: configURL),
-                  var json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
-            else {
-                lastError = "配置文件尚未创建。请先刷新账号。"
-                return false
+            var json: [String: Any] = [:]
+            if FileManager.default.fileExists(atPath: configURL.path) {
+                let data = try Data(contentsOf: configURL)
+                guard let loaded = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                    lastError = "配置文件不是有效的 JSON 对象。"
+                    return false
+                }
+                json = loaded
             }
-            json["addr"] = trimmed
-            json["default_model"] = model
-            json["session_reuse"] = reuse
-            let updated = try JSONSerialization.data(
+            change(&json)
+            let data = try JSONSerialization.data(
                 withJSONObject: json,
                 options: [.prettyPrinted, .sortedKeys]
             )
-            try updated.write(to: configURL, options: .atomic)
+            try data.write(to: configURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: configURL.path
+            )
             reloadConfig()
-            notice = isRunning ? "设置已保存。重启代理后生效。" : "设置已保存。"
+            notice = isRunning ? "配置已保存。请重启代理使设置生效。" : "配置已保存。"
             lastError = nil
             return true
         } catch {
-            lastError = "保存设置失败：\(error.localizedDescription)"
+            lastError = "保存失败：\(error.localizedDescription)"
             return false
         }
+    }
+
+    func saveSettings(host: String, port: String, model: String, reuse: Bool) -> Bool {
+        let value = port.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard ["127.0.0.1", "localhost"].contains(host),
+              value.allSatisfy({ $0.isNumber }),
+              let numericPort = Int(value),
+              (1...65535).contains(numericPort)
+        else {
+            lastError = "端口必须是 1–65535 之间的整数。"
+            return false
+        }
+        guard modelOptions.contains(model) else {
+            lastError = "请选择已有的模型别名。"
+            return false
+        }
+        return persistConfig { json in
+            json["addr"] = "\(host):\(numericPort)"
+            json["default_model"] = model
+            json["session_reuse"] = reuse
+        }
+    }
+
+    func saveAPIKeys(_ keys: [String]) -> Bool {
+        let cleaned = keys.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard cleaned.allSatisfy({
+            !$0.isEmpty &&
+            !$0.contains(where: { $0.isWhitespace || $0.isNewline })
+        }), Set(cleaned).count == cleaned.count else {
+            lastError = "API Key 不能为空、包含空白字符或重复。"
+            return false
+        }
+        return persistConfig { json in
+            json["api_keys"] = cleaned
+        }
+    }
+
+    func restartServer() {
+        guard isRunning else {
+            startServer()
+            return
+        }
+        restartPending = true
+        stopServer()
     }
 
     private func makeProcess(command: String, arguments: [String] = []) throws -> Process {
@@ -182,6 +242,10 @@ final class ProxyManager: ObservableObject {
                         self.lastError = "代理进程已退出。请查看运行日志。"
                     }
                     self.stopRequested = false
+                    if self.restartPending {
+                        self.restartPending = false
+                        self.startServer()
+                    }
                 }
             }
 
@@ -355,550 +419,5 @@ final class ProxyManager: ObservableObject {
             ))
         }
         return entries
-    }
-}
-
-private struct Surface<Content: View>: View {
-    let content: Content
-
-    init(@ViewBuilder content: () -> Content) {
-        self.content = content()
-    }
-
-    var body: some View {
-        content
-            .padding(22)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.white)
-            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 16, style: .continuous)
-                    .stroke(Style.border, lineWidth: 1)
-            )
-    }
-}
-
-private struct Metric: View {
-    let title: String
-    let value: String
-    let note: String
-    let icon: String
-
-    var body: some View {
-        Surface {
-            HStack {
-                Text(title)
-                    .font(.system(size: 13, weight: .medium))
-                    .foregroundStyle(Style.secondary)
-                Spacer()
-                Image(systemName: icon)
-                    .foregroundStyle(Style.accent)
-            }
-            Text(value)
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
-                .foregroundStyle(Style.ink)
-                .lineLimit(1)
-                .minimumScaleFactor(0.75)
-                .padding(.top, 9)
-            Text(note)
-                .font(.system(size: 12))
-                .foregroundStyle(Style.secondary)
-                .padding(.top, 2)
-        }
-    }
-}
-
-private struct OverviewView: View {
-    @ObservedObject var manager: ProxyManager
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Surface {
-                HStack(alignment: .center, spacing: 18) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 13)
-                            .fill(manager.isRunning ? Style.success.opacity(0.12) : Style.border)
-                            .frame(width: 56, height: 56)
-                        Image(systemName: "point.3.connected.trianglepath.dotted")
-                            .font(.system(size: 25))
-                            .foregroundStyle(manager.isRunning ? Style.success : Style.secondary)
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(manager.isRunning ? "代理服务运行中" : "代理服务已停止")
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundStyle(Style.ink)
-                        Text("OpenAI 兼容接口 · 本机 HTTP 服务")
-                            .font(.system(size: 13))
-                            .foregroundStyle(Style.secondary)
-                    }
-                    Spacer()
-                    Button {
-                        manager.isRunning ? manager.stopServer() : manager.startServer()
-                    } label: {
-                        Label(
-                            manager.isRunning ? "停止代理" : "启动代理",
-                            systemImage: manager.isRunning ? "stop.fill" : "play.fill"
-                        )
-                        .font(.system(size: 13, weight: .semibold))
-                        .frame(minWidth: 98)
-                        .padding(.vertical, 7)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(manager.isRunning ? Style.ink : Style.accent)
-                    .controlSize(.large)
-                }
-            }
-
-            HStack(spacing: 16) {
-                Metric(
-                    title: "服务状态",
-                    value: manager.isRunning ? "运行中" : "已停止",
-                    note: manager.isRunning ? "监听本机请求" : "点击启动代理",
-                    icon: "waveform.path"
-                )
-                Metric(
-                    title: "已登录账号",
-                    value: "\(manager.accounts.count)",
-                    note: "支持多账号轮询",
-                    icon: "person.2.fill"
-                )
-                Metric(
-                    title: "默认模型",
-                    value: manager.defaultModel,
-                    note: "由 config.json 配置",
-                    icon: "cpu"
-                )
-            }
-
-            Surface {
-                Text("API 接入")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Style.ink)
-                Text("Base URL")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(Style.secondary)
-                    .padding(.top, 17)
-                HStack {
-                    Text(manager.endpoint)
-                        .font(.system(size: 15, design: .monospaced))
-                        .foregroundStyle(Style.ink)
-                        .textSelection(.enabled)
-                    Spacer()
-                    Button {
-                        manager.copyEndpoint()
-                    } label: {
-                        Label("复制地址", systemImage: "doc.on.doc")
-                    }
-                }
-                .padding(14)
-                .background(Style.background)
-                .clipShape(RoundedRectangle(cornerRadius: 9))
-                .padding(.top, 1)
-                Text("接口：/chat/completions、/models")
-                    .font(.system(size: 12))
-                    .foregroundStyle(Style.secondary)
-                    .padding(.top, 9)
-            }
-        }
-    }
-}
-
-private struct AccountsView: View {
-    @ObservedObject var manager: ProxyManager
-    @State private var pendingRemoval: AccountEntry?
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Surface {
-                HStack {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text("账号列表")
-                            .font(.system(size: 18, weight: .semibold))
-                        Text("账号由本机 SQLite 数据库保存。")
-                            .font(.system(size: 12))
-                            .foregroundStyle(Style.secondary)
-                    }
-                    Spacer()
-                    Button("刷新令牌") { manager.refreshTokens() }
-                        .disabled(manager.isWorking || manager.accounts.isEmpty)
-                    Button {
-                        manager.login()
-                    } label: {
-                        Label("添加账号", systemImage: "plus")
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Style.accent)
-                    .disabled(manager.isWorking)
-                }
-            }
-
-            if manager.accounts.isEmpty {
-                Surface {
-                    VStack(spacing: 14) {
-                        Image(systemName: "person.crop.circle.badge.plus")
-                            .font(.system(size: 36))
-                            .foregroundStyle(Style.accent)
-                        Text("尚未添加账号")
-                            .font(.system(size: 17, weight: .medium))
-                        Text("点击“添加账号”，在浏览器中完成 Amazon Quick 登录。")
-                            .font(.system(size: 13))
-                            .foregroundStyle(Style.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 45)
-                }
-            } else {
-                Surface {
-                    ForEach(Array(manager.accounts.enumerated()), id: \.element.id) { index, account in
-                        if index > 0 {
-                            Divider().padding(.vertical, 12)
-                        }
-                        HStack(spacing: 14) {
-                            ZStack {
-                                Circle().fill(Style.accent.opacity(0.10))
-                                    .frame(width: 40, height: 40)
-                                Image(systemName: "person.crop.circle")
-                                    .foregroundStyle(Style.accent)
-                            }
-                            VStack(alignment: .leading, spacing: 5) {
-                                Text(account.email)
-                                    .font(.system(size: 14, weight: .semibold))
-                                    .foregroundStyle(Style.ink)
-                                Text("\(account.provider) · 到期：\(account.expires) · 调用：\(account.uses)")
-                                    .font(.system(size: 12))
-                                    .foregroundStyle(Style.secondary)
-                            }
-                            Spacer()
-                            Text(account.isReady ? "正常" : account.status)
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundStyle(account.isReady ? Style.success : Style.secondary)
-                            Button("移除") { pendingRemoval = account }
-                                .disabled(manager.isWorking)
-                        }
-                    }
-                }
-            }
-        }
-        .confirmationDialog(
-            "移除账号",
-            isPresented: Binding(
-                get: { pendingRemoval != nil },
-                set: { if !$0 { pendingRemoval = nil } }
-            ),
-            titleVisibility: .visible
-        ) {
-            Button("确认移除", role: .destructive) {
-                if let account = pendingRemoval {
-                    manager.removeAccount(account)
-                }
-                pendingRemoval = nil
-            }
-            Button("取消", role: .cancel) { pendingRemoval = nil }
-        } message: {
-            Text("这将从本机数据库删除所选账号的登录信息。")
-        }
-    }
-}
-
-private struct SettingsView: View {
-    @ObservedObject var manager: ProxyManager
-    @State private var address = "127.0.0.1:8080"
-    @State private var model = "smart"
-    @State private var reuse = true
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            Surface {
-                Text("代理配置")
-                    .font(.system(size: 18, weight: .semibold))
-                    .foregroundStyle(Style.ink)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("监听地址")
-                        .font(.system(size: 13, weight: .medium))
-                    TextField("127.0.0.1:8080", text: $address)
-                        .textFieldStyle(.roundedBorder)
-                }
-                .padding(.top, 17)
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("默认模型")
-                        .font(.system(size: 13, weight: .medium))
-                    Picker("默认模型", selection: $model) {
-                        ForEach(["smart", "fast", "balanced", "auto"], id: \.self) { item in
-                            Text(item).tag(item)
-                        }
-                    }
-                    .labelsHidden()
-                    .frame(width: 210)
-                }
-                .padding(.top, 12)
-
-                Toggle("复用上游会话", isOn: $reuse)
-                    .padding(.top, 10)
-
-                HStack {
-                    Text("修改配置后，需要重新启动代理。")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Style.secondary)
-                    Spacer()
-                    Button("保存设置") {
-                        _ = manager.saveSettings(address: address, model: model, reuse: reuse)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(Style.accent)
-                }
-                .padding(.top, 14)
-            }
-
-            Surface {
-                Text("数据与配置文件")
-                    .font(.system(size: 17, weight: .semibold))
-                    .foregroundStyle(Style.ink)
-                Text(manager.supportURL.path)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Style.secondary)
-                    .textSelection(.enabled)
-                    .padding(.top, 10)
-                HStack(spacing: 12) {
-                    Button {
-                        manager.openConfig()
-                    } label: {
-                        Label("打开 config.json", systemImage: "doc.text")
-                    }
-                    Button {
-                        manager.openDataDirectory()
-                    } label: {
-                        Label("打开数据目录", systemImage: "folder")
-                    }
-                }
-                .padding(.top, 14)
-            }
-        }
-        .onAppear {
-            manager.reloadConfig()
-            let value = manager.endpoint
-            address = value.replacingOccurrences(of: "http://", with: "")
-                .replacingOccurrences(of: "/v1", with: "")
-            model = manager.defaultModel
-            reuse = manager.sessionReuse
-        }
-    }
-}
-
-private struct LogsView: View {
-    @ObservedObject var manager: ProxyManager
-
-    var body: some View {
-        Surface {
-            HStack {
-                Text("进程输出")
-                    .font(.system(size: 18, weight: .semibold))
-                Spacer()
-                Button {
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(manager.logText, forType: .string)
-                } label: {
-                    Label("复制日志", systemImage: "doc.on.doc")
-                }
-            }
-            ScrollView {
-                Text(manager.logText.isEmpty ? "启动代理后，运行日志将显示在这里。" : manager.logText)
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundStyle(Style.ink)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(14)
-            }
-            .frame(minHeight: 360)
-            .background(Style.background)
-            .clipShape(RoundedRectangle(cornerRadius: 9))
-            .padding(.top, 14)
-        }
-    }
-}
-
-private struct RootView: View {
-    @ObservedObject var manager: ProxyManager
-    @State private var selection: AppPage = .overview
-
-    var body: some View {
-        HStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 0) {
-                HStack(spacing: 10) {
-                    Image(systemName: "point.3.connected.trianglepath.dotted")
-                        .font(.system(size: 23, weight: .semibold))
-                        .foregroundStyle(Color.white)
-                        .frame(width: 37, height: 37)
-                        .background(Style.accent)
-                        .clipShape(RoundedRectangle(cornerRadius: 11))
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text("QuickProxy")
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(Color.white)
-                        Text("Amazon Quick API")
-                            .font(.system(size: 10))
-                            .foregroundStyle(Color.white.opacity(0.6))
-                    }
-                }
-                .padding(.bottom, 36)
-
-                ForEach(AppPage.allCases) { page in
-                    Button {
-                        selection = page
-                    } label: {
-                        HStack(spacing: 12) {
-                            Image(systemName: page.icon)
-                                .frame(width: 20)
-                            Text(page.rawValue)
-                            Spacer()
-                        }
-                        .font(.system(size: 13, weight: selection == page ? .semibold : .medium))
-                        .foregroundStyle(selection == page ? Color.white : Color.white.opacity(0.66))
-                        .padding(.horizontal, 13)
-                        .padding(.vertical, 12)
-                        .background(
-                            selection == page ? Color.white.opacity(0.13) : Color.clear
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 9))
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.bottom, 5)
-                }
-
-                Spacer()
-                HStack(spacing: 8) {
-                    Circle()
-                        .fill(manager.isRunning ? Style.success : Color.gray)
-                        .frame(width: 8, height: 8)
-                    Text(manager.isRunning ? "服务运行中" : "服务已停止")
-                        .font(.system(size: 12))
-                        .foregroundStyle(Color.white.opacity(0.75))
-                }
-                .padding(.bottom, 10)
-                Text("账号信息保存在本机")
-                    .font(.system(size: 11))
-                    .foregroundStyle(Color.white.opacity(0.42))
-            }
-            .padding(22)
-            .frame(width: 226)
-            .background(Style.sidebar)
-
-            VStack(spacing: 0) {
-                HStack {
-                    VStack(alignment: .leading, spacing: 5) {
-                        Text(selection.rawValue)
-                            .font(.system(size: 23, weight: .bold))
-                            .foregroundStyle(Style.ink)
-                        Text(selection.subtitle)
-                            .font(.system(size: 12))
-                            .foregroundStyle(Style.secondary)
-                    }
-                    Spacer()
-                    if manager.isWorking {
-                        ProgressView()
-                            .controlSize(.small)
-                        Text(manager.operation)
-                            .font(.system(size: 12))
-                            .foregroundStyle(Style.secondary)
-                    } else {
-                        Button {
-                            manager.refreshAccounts()
-                        } label: {
-                            Label("刷新账号", systemImage: "arrow.clockwise")
-                        }
-                        .disabled(manager.isWorking)
-                    }
-                }
-                .padding(.horizontal, 28)
-                .padding(.vertical, 25)
-
-                Rectangle().fill(Style.border).frame(height: 1)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        if let error = manager.lastError {
-                            Label(error, systemImage: "exclamationmark.triangle")
-                                .font(.system(size: 12))
-                                .foregroundStyle(Color(red: 0.66, green: 0.21, blue: 0.14))
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Color(red: 1, green: 0.94, blue: 0.91))
-                                .clipShape(RoundedRectangle(cornerRadius: 9))
-                        }
-                        if let notice = manager.notice {
-                            Label(notice, systemImage: "checkmark.circle")
-                                .font(.system(size: 12))
-                                .foregroundStyle(Style.success)
-                                .padding(12)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .background(Style.success.opacity(0.08))
-                                .clipShape(RoundedRectangle(cornerRadius: 9))
-                        }
-                        switch selection {
-                        case .overview: OverviewView(manager: manager)
-                        case .accounts: AccountsView(manager: manager)
-                        case .settings: SettingsView(manager: manager)
-                        case .logs: LogsView(manager: manager)
-                        }
-                    }
-                    .padding(27)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-            }
-            .background(Style.background)
-        }
-        .frame(minWidth: 940, minHeight: 640)
-    }
-}
-
-final class AppDelegate: NSObject, NSApplicationDelegate {
-    weak var manager: ProxyManager?
-
-    func applicationWillTerminate(_ notification: Notification) {
-        manager?.shutdown()
-    }
-}
-
-@main
-struct QuickProxyApp: App {
-    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @StateObject private var manager = ProxyManager()
-
-    var body: some Scene {
-        WindowGroup("QuickProxy", id: "main") {
-            RootView(manager: manager)
-                .preferredColorScheme(.light)
-                .onAppear {
-                    appDelegate.manager = manager
-                    manager.prepare()
-                }
-        }
-        .defaultSize(width: 1010, height: 680)
-
-        MenuBarExtra("QuickProxy", systemImage: "point.3.connected.trianglepath.dotted") {
-            Text(manager.isRunning ? "代理服务运行中" : "代理服务已停止")
-            Text(manager.endpoint)
-            Divider()
-            Button(manager.isRunning ? "停止代理" : "启动代理") {
-                manager.isRunning ? manager.stopServer() : manager.startServer()
-            }
-            Button("刷新账号") { manager.refreshAccounts() }
-                .disabled(manager.isWorking)
-            Divider()
-            OpenMainWindowButton()
-            Button("退出 QuickProxy") {
-                NSApplication.shared.terminate(nil)
-            }
-        }
-        .menuBarExtraStyle(.menu)
-    }
-}
-
-private struct OpenMainWindowButton: View {
-    @Environment(\.openWindow) private var openWindow
-
-    var body: some View {
-        Button("打开管理窗口") { openWindow(id: "main") }
     }
 }

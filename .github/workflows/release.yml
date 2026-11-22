@@ -75,7 +75,7 @@ jobs:
               -sdk "$SDK" -parse-as-library -O \
               -framework SwiftUI -framework AppKit -framework Foundation \
               -o "build/gui-$ARCH" \
-              macos/QuickProxyApp.swift
+              macos/QuickProxyApp.swift macos/DashboardViews.swift
           done
       - name: Assemble and sign app
         shell: bash
