@@ -193,7 +193,7 @@ for chunk in client.chat.completions.create(
 
 | 命令 | 说明 |
 |---|---|
-| `quickproxy serve` | 启动反代 |
+| `quickproxy server` | 启动反代 |
 | `quickproxy login` | 浏览器 OAuth 登录并写入 SQLite |
 | `quickproxy accounts` | 列出账号、到期时间、使用次数与最近错误 |
 | `quickproxy refresh` | 刷新全部账号的 token |
