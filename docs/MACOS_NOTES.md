@@ -63,3 +63,13 @@
 - 通过图形界面输入的 API Key 不应包含空白字符；同一份配置中不能有重复密钥。
 - 本界面不提供密钥使用量统计和账号级配额控制，这些需要另行设计。
 - 已通过 GitHub Actions 验证编译与打包。浏览器登录和实际上游 API 调用仍需使用有效账号测试。
+
+
+## 实际模型观测
+
+- 具体模型 ID 来自真实成功请求中的上游 `turn_usage` 数据，不能仅凭请求档位推断。
+- 未执行过成功请求、上游没有返回相关字段或后端未更新时，`/v1/models` 只展示已配置的档位。
+- 观测记录为历史事实，无法保证上游下次使用相同模型。`/v1/models` 把具体模型 ID 映射到上次观测对应的 agent mode；不具备底层模型强制选择能力。
+- 记录路径：`~/Library/Application Support/QuickProxy/data/observed-models.json`。文件不包含 API Key 或会话内容。
+- CC Switch 获取模型需使用 `http://127.0.0.1:<监听端口>/v1` 和正确的本地 API Key。
+- 当前 Go 服务对聊天请求使用 OpenAI Chat Completions 协议；直接作为 Anthropic Messages API 服务接入 Claude Desktop 时仍需协议转换层。

@@ -381,3 +381,17 @@ Thanks to the [LINUX DO](https://linux.do) community for its support.
 配置与账号数据库位于用户目录 ~/Library/Application Support/QuickProxy/，安装新版本不会覆盖该目录。
 
 安装限制、签名状态及高级配置说明集中放在 [macOS 构建与限制说明](docs/MACOS_NOTES.md)。
+
+
+### 实际模型识别（Amazon Quick 上游路由）
+
+Amazon Quick 请求使用 agent mode（如 smart、fast、balanced），上游决定本轮实际运行的模型。模型的真实标识会随调度和服务端更新变化。
+
+- 新版会从上游 `turn_usage` 事件提取 `resolved_model_id` 与 `served_model_id`，并在 OpenAI 兼容响应的 `usage` 字段中附带这些值。
+- **至少成功调用一次对应档位**后，`GET /v1/models` 才会在原有档位之外列出实际观测到的底层模型 ID。列表中的 `owned_by: quickwork-observed`、`agent_mode`、`observed_at`、`direct_selection: false` 可区分观测记录。
+- 在 CC Switch 等客户端选择这类观测模型 ID 时，代理按最近一次记录的 `agent_mode` 发往上游；**不会强制锁定该底层模型**，下一次请求可能被路由到其他模型。
+- 仅访问 `/v1/models` 不会触发上游推理或主动模型扫描。
+- 观测记录仅包含模型 ID、档位和时间，保存到配置文件同级的 `data/observed-models.json`，不存储 token、用户内容或账号信息。重启代理后依旧可查看。
+- 即使该账号的上游 `turn_usage` 不返回模型标识，原有档位模型列表和聊天功能仍正常工作。
+
+该功能参考 [magpie-aws-quick](https://github.com/httpdone/magpie-aws-quick) 对 `turn_usage` 的处理思路；该项目同样以 agent mode 调度。见其 `lib/handler.mjs` 与 `lib/translate.mjs`。

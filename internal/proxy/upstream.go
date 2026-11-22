@@ -62,6 +62,8 @@ type Usage struct {
 	TotalTokens      int
 	CacheReadTokens  int
 	CacheWriteTokens int
+	ResolvedModelID  string
+	ServedModelID    string
 }
 
 func (u *Usage) add(v Usage) {
@@ -70,6 +72,12 @@ func (u *Usage) add(v Usage) {
 	u.TotalTokens += v.TotalTokens
 	u.CacheReadTokens += v.CacheReadTokens
 	u.CacheWriteTokens += v.CacheWriteTokens
+	if v.ResolvedModelID != "" {
+		u.ResolvedModelID = v.ResolvedModelID
+	}
+	if v.ServedModelID != "" {
+		u.ServedModelID = v.ServedModelID
+	}
 }
 
 // StreamEvent is a text delta or a native tool call from the upstream agent.
@@ -542,21 +550,8 @@ func (u *Upstream) readEvents(ctx context.Context, conn *websocket.Conn, gateway
 			}
 			sawMessageComplete = true
 		case "turn_usage":
-			var p struct {
-				InputTokens      int `json:"input_tokens"`
-				OutputTokens     int `json:"output_tokens"`
-				TotalTokens      int `json:"total_tokens"`
-				CacheReadTokens  int `json:"cache_read_tokens"`
-				CacheWriteTokens int `json:"cache_write_tokens"`
-			}
-			if err := json.Unmarshal(env.Payload, &p); err == nil {
-				result.Usage.add(Usage{
-					PromptTokens:     p.InputTokens,
-					CompletionTokens: p.OutputTokens,
-					TotalTokens:      p.TotalTokens,
-					CacheReadTokens:  p.CacheReadTokens,
-					CacheWriteTokens: p.CacheWriteTokens,
-				})
+			if usage, err := parseTurnUsage(env.Payload); err == nil {
+				result.Usage.add(usage)
 			}
 		case "tool_start", "tool_arguments", "tool_arguments_edited":
 			var p struct {
@@ -895,4 +890,37 @@ func titleFor(prompt string) string {
 		clean = "New Conversation"
 	}
 	return clean
+}
+
+
+// parseTurnUsage accepts wire snake_case and camelCase variants.
+// Actual model IDs become available after upstream dispatches a turn.
+func parseTurnUsage(raw json.RawMessage) (Usage, error) {
+	var wire struct {
+		InputTokens       int    `json:"input_tokens"`
+		OutputTokens      int    `json:"output_tokens"`
+		TotalTokens       int    `json:"total_tokens"`
+		CacheReadTokens   int    `json:"cache_read_tokens"`
+		CacheWriteTokens  int    `json:"cache_write_tokens"`
+		ResolvedModelID   string `json:"resolved_model_id"`
+		ServedModelID     string `json:"served_model_id"`
+		ResolvedModelAlt  string `json:"resolvedModelId"`
+		ServedModelAlt    string `json:"servedModelId"`
+	}
+	if err := json.Unmarshal(raw, &wire); err != nil {
+		return Usage{}, err
+	}
+	resolved := wire.ResolvedModelID
+	if resolved == "" { resolved = wire.ResolvedModelAlt }
+	served := wire.ServedModelID
+	if served == "" { served = wire.ServedModelAlt }
+	return Usage{
+		PromptTokens: wire.InputTokens,
+		CompletionTokens: wire.OutputTokens,
+		TotalTokens: wire.TotalTokens,
+		CacheReadTokens: wire.CacheReadTokens,
+		CacheWriteTokens: wire.CacheWriteTokens,
+		ResolvedModelID: resolved,
+		ServedModelID: served,
+	}, nil
 }

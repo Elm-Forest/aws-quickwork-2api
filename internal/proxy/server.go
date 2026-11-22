@@ -21,6 +21,7 @@ type Server struct {
 	tokens   *APIKeyAuth
 	upstream *Upstream
 	sessions *conversationStore
+	models   *modelRegistry
 }
 
 func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
@@ -30,6 +31,7 @@ func NewServer(cfg *config.Config, mgr *accounts.Manager) *Server {
 		tokens:   NewAPIKeyAuth(cfg.APIKeys),
 		upstream: NewUpstream(cfg),
 		sessions: newConversationStore(cfg.SessionTTL.Duration(), 256),
+		models:   newModelRegistry(cfg.Path),
 	}
 }
 
@@ -67,16 +69,7 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusUnauthorized, "invalid_api_key", "invalid proxy API key")
 		return
 	}
-	created := time.Now().Unix()
-	data := make([]map[string]any, 0, len(s.cfg.Models))
-	for _, id := range s.cfg.Models {
-		data = append(data, map[string]any{
-			"id":       id,
-			"object":   "model",
-			"created":  created,
-			"owned_by": "quickwork",
-		})
-	}
+	data := s.models.listForOpenAI(s.cfg.Models)
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": data})
 }
 
@@ -290,6 +283,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		if len(toolCalls) > 0 {
 			finish = "tool_calls"
 		}
+		s.models.record(model, res.Usage)
 		logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(toolCalls), nil)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"id":      id,
@@ -510,6 +504,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		}}}, nil)
 	}
 	writeChunk(map[string]any{}, finish)
+	s.models.record(model, res.Usage)
 	logChatDone(id, startedAt, in, usedAccount, attempts, "ok", finish, res.Usage, len(outTools), nil)
 	if req.StreamOptions != nil && req.StreamOptions.IncludeUsage {
 		writePayload(map[string]any{
@@ -576,8 +571,11 @@ func (s *Server) mapModel(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	m = strings.TrimPrefix(m, "quickwork/")
 	m = strings.TrimPrefix(m, "qw-")
+	if mode, known := s.models.lookup(strings.TrimSpace(model)); known {
+		return mode
+	}
 	switch m {
-	case "smart", "fast", "balanced", "auto":
+	case "smart", "fast", "balanced", "advanced", "auto":
 		return m
 	case "":
 		return s.cfg.DefaultModel
@@ -604,6 +602,12 @@ func usageMap(u Usage) map[string]any {
 	}
 	if u.CacheReadTokens > 0 {
 		m["prompt_tokens_details"] = map[string]any{"cached_tokens": u.CacheReadTokens}
+	}
+	if u.ResolvedModelID != "" {
+		m["resolved_model_id"] = u.ResolvedModelID
+	}
+	if u.ServedModelID != "" {
+		m["served_model_id"] = u.ServedModelID
 	}
 	return m
 }
