@@ -65,6 +65,7 @@ final class ProxyManager: ObservableObject {
     private var prepared = false
     private var serverProcess: Process?
     private var serverPipe: Pipe?
+    private var stopRequested = false
 
     let supportURL: URL = FileManager.default.urls(
         for: .applicationSupportDirectory,
@@ -160,6 +161,7 @@ final class ProxyManager: ObservableObject {
         guard !isRunning else { return }
         lastError = nil
         notice = nil
+        stopRequested = false
         do {
             let process = try makeProcess(command: "server")
             let pipe = Pipe()
@@ -176,9 +178,10 @@ final class ProxyManager: ObservableObject {
                     self.serverProcess = nil
                     self.isRunning = false
                     self.appendLog("代理进程已退出，退出码：\(finished.terminationStatus)\n")
-                    if finished.terminationStatus != 0 {
+                    if finished.terminationStatus != 0 && !self.stopRequested {
                         self.lastError = "代理进程已退出。请查看运行日志。"
                     }
+                    self.stopRequested = false
                 }
             }
 
@@ -205,6 +208,7 @@ final class ProxyManager: ObservableObject {
     func stopServer() {
         guard let process = serverProcess else { return }
         if process.isRunning {
+            stopRequested = true
             appendLog("正在停止代理…\n")
             process.terminate()
         }
@@ -355,7 +359,11 @@ final class ProxyManager: ObservableObject {
 }
 
 private struct Surface<Content: View>: View {
-    @ViewBuilder let content: Content
+    let content: Content
+
+    init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
 
     var body: some View {
         content
@@ -768,7 +776,7 @@ private struct RootView: View {
                         .foregroundStyle(Color.white.opacity(0.75))
                 }
                 .padding(.bottom, 10)
-                Text("数据仅保存在本机")
+                Text("账号信息保存在本机")
                     .font(.system(size: 11))
                     .foregroundStyle(Color.white.opacity(0.42))
             }
@@ -879,7 +887,6 @@ struct QuickProxyApp: App {
             Divider()
             OpenMainWindowButton()
             Button("退出 QuickProxy") {
-                manager.shutdown()
                 NSApplication.shared.terminate(nil)
             }
         }
