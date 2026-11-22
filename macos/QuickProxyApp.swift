@@ -868,6 +868,7 @@ struct QuickProxyApp: App {
     var body: some Scene {
         WindowGroup("QuickProxy", id: "main") {
             RootView(manager: manager)
+                .preferredColorScheme(.light)
                 .onAppear {
                     appDelegate.manager = manager
                     manager.prepare()
