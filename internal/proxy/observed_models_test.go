@@ -48,6 +48,7 @@ func TestObservedModelsPersistenceAndMapping(t *testing.T) {
     registry := newModelRegistry(configPath)
     registry.record("smart", Usage{ResolvedModelID: "us.anthropic.claude-opus-5-5"})
     registry.record("fast", Usage{ServedModelID: "us.anthropic.claude-haiku-5-5"})
+    registry.record("smart", Usage{ResolvedModelID: "us.anthropic.claude-opus-5-5", ServedModelID: "obsolete.other-model"})
     registry.record("fast", Usage{ResolvedModelID: "../../inject"})
     registry.record("unknown", Usage{ResolvedModelID: "us.anthropic.ignored"})
     entries := registry.list()

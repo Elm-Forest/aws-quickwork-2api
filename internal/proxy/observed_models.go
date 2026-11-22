@@ -97,18 +97,13 @@ func (r *modelRegistry) lookup(id string) (string, bool) {
 func (r *modelRegistry) record(mode string, usage Usage) {
     mode = strings.ToLower(strings.TrimSpace(mode))
     if !isAgentMode(mode) { return }
-    ids := []string{usage.ResolvedModelID, usage.ServedModelID}
+    id := strings.TrimSpace(usage.ResolvedModelID)
+    if id == "" { id = strings.TrimSpace(usage.ServedModelID) }
+    if !observedModelID.MatchString(id) || isAgentMode(id) { return }
     now := time.Now().UTC()
     r.mu.Lock()
     defer r.mu.Unlock()
-    changed := false
-    for _, id := range ids {
-        id = strings.TrimSpace(id)
-        if !observedModelID.MatchString(id) || isAgentMode(id) { continue }
-        r.entries[id] = observedModel{ID: id, AgentMode: mode, LastSeen: now}
-        changed = true
-    }
-    if !changed { return }
+    r.entries[id] = observedModel{ID: id, AgentMode: mode, LastSeen: now}
     r.prune()
     if r.path == "" { return }
     if err := os.MkdirAll(filepath.Dir(r.path), 0o700); err != nil {
